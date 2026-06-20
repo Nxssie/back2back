@@ -199,14 +199,17 @@ function createAudioStream(videoId: string): {
   ytdlp.on("error", (e) => console.error(`❌ yt-dlp error for ${videoId}:`, e));
   ffmpeg.on("error", (e) => console.error(`❌ ffmpeg error for ${videoId}:`, e));
 
-  // Tie the two together so neither lingers once the other exits.
+  // If ffmpeg exits (for any reason), yt-dlp is no longer useful.
   ffmpeg.on("close", () => {
     if (!ytdlp.killed) {
       try { ytdlp.kill("SIGKILL"); } catch {}
     }
   });
-  ytdlp.on("close", () => {
-    if (!ffmpeg.killed) {
+  // When yt-dlp finishes downloading (exit 0), let ffmpeg drain its buffer
+  // and close naturally — killing it here would cut the end of the track.
+  // Only kill ffmpeg if yt-dlp crashed (non-zero exit).
+  ytdlp.on("close", (code) => {
+    if (code !== 0 && !ffmpeg.killed) {
       try { ffmpeg.kill("SIGKILL"); } catch {}
     }
   });
