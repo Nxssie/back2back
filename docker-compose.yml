@@ -57,8 +57,22 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    networks:
+      - default
+      - coolify
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.b2b-web.rule=Host(`b2b.nxssie.dev`)"
+      - traefik.http.routers.b2b-web.entrypoints=websecure
+      - traefik.http.routers.b2b-web.tls=true
+      - traefik.http.routers.b2b-web.tls.certresolver=letsencrypt
+      - traefik.http.services.b2b-web.loadbalancer.server.port=80
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+networks:
+  coolify:
+    external: true
