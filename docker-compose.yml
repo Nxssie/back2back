@@ -42,8 +42,8 @@ services:
     build:
       context: .
       dockerfile: packages/web/Dockerfile
-    ports:
-      - "3000:80"
+    expose:
+      - "80"
     depends_on:
       server:
         condition: service_healthy
