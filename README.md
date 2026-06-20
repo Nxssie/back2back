@@ -1,6 +1,6 @@
 # Back2Back 🎵
 
-Música sincronizada en tiempo real con tus amigos. Reemplaza el flujo de Discord de pasar enlaces a bots.
+Synchronized music playback with your friends. Replaces the Discord workflow of passing links to bots.
 
 ## Tech Stack
 
@@ -11,7 +11,7 @@ Música sincronizada en tiempo real con tus amigos. Reemplaza el flujo de Discor
 - **Audio**: yt-dlp + @discordjs/voice
 - **Bot**: Discord.js
 
-## Arquitectura
+## Architecture
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
@@ -26,41 +26,41 @@ Música sincronizada en tiempo real con tus amigos. Reemplaza el flujo de Discor
                     └─────────────┘
 ```
 
-## Desarrollo
+## Development
 
-### Requisitos
+### Requirements
 - Bun
-- yt-dlp (audio en desarrollo local)
-- Docker (opcional, para el deploy con Compose)
+- yt-dlp (for local audio playback)
+- Docker (optional, for Compose-based deploy)
 - Discord Bot Token
 
-### Instalar
+### Setup
 
 ```bash
-# Clonar e instalar dependencias
-git clone <repo>
+# Clone and install dependencies
+git clone git@github.com:Nxssie/back2back.git
 cd back2back
 bun install
 
-# Copiar variables de entorno
+# Copy environment variables
 cp .env.example .env
-# Editar .env con tu DISCORD_TOKEN
+# Edit .env with your Discord credentials
 
-# Generar migraciones de DB
+# Run database migrations
 bun db:generate
 bun db:push
 ```
 
-### Ejecutar
+### Running
 
-**Opción 1: Todo con Docker (recomendado para producción)**
+**Option 1: Docker (recommended for production)**
 ```bash
 docker compose up
 ```
 
-**Opción 2: Desarrollo local**
+**Option 2: Local development**
 ```bash
-# Instalar yt-dlp
+# Install yt-dlp
 pip install yt-dlp
 
 # Terminal 1: Server
@@ -70,7 +70,7 @@ cd packages/server && bun dev
 cd packages/web && bun dev
 ```
 
-O usa el script:
+Or use the convenience script:
 ```bash
 ./dev.sh
 ```
@@ -81,38 +81,38 @@ O usa el script:
 
 ## API
 
-### Salas
-- `GET /api/rooms/:id` - Obtener sala
-- `GET /api/rooms/:id/songs` - Obtener canciones
-- `POST /api/rooms/:id/songs` - Añadir canción `{ url, addedBy }`
-- `POST /api/rooms/:id/songs/:songId/vote` - Votar
+### Rooms
+- `GET /api/rooms/:id` — Get room
+- `GET /api/rooms/:id/songs` — List songs
+- `POST /api/rooms/:id/songs` — Add song `{ url, addedBy }`
+- `POST /api/rooms/:id/songs/:songId/vote` — Vote on a song
 
 ### Discord Bot
-- `/play <url>` - Añadir a la cola y reproducir
-- `/listen` - Unirse al canal y empezar la cola
-- `/stop` - Parar y desconectar
-- `/skip` - Saltar canción actual
-- `/queue` - Ver la cola
-- `/reset` - Resetear canciones reproducidas
+- `/play <url>` — Add to queue and play
+- `/listen` — Join voice channel and start the queue
+- `/stop` — Stop playback and disconnect
+- `/skip` — Skip the current song
+- `/queue` — Show the current queue
+- `/reset` — Reset played songs
 
 ## Deploy (Coolify)
 
 ```bash
-# 1. Push a tu repo
+# 1. Push to your repo
 git push
 
-# 2. En Coolify, crear nueva app Docker Compose
-# 3. Apuntar al docker-compose.yml
-# 4. Agregar variables de entorno:
-#    - DISCORD_TOKEN=tu_token
-#    - DISCORD_CLIENT_ID=tu_id
-#    - DISCORD_CLIENT_SECRET=tu_secret
+# 2. In Coolify, create a new Docker Compose app
+# 3. Point it to docker-compose.yml
+# 4. Add environment variables:
+#    - DISCORD_TOKEN=your_token
+#    - DISCORD_CLIENT_ID=your_id
+#    - DISCORD_CLIENT_SECRET=your_secret
+#    - DISCORD_REDIRECT_URI=https://your-domain/auth/discord/callback
+#    - FRONTEND_URL=https://your-domain
+#    - JWT_SECRET=$(openssl rand -hex 32)
 ```
 
 ## TODO
 
-- [ ] Discord OAuth2 para login
-- [ ] WebSockets completos (sync real-time)
-- [ ] UI mejorada
-- [ ] Cola automática (siguiente canción)
-- [ ] Bot slash commands completos
+- [ ] WebSocket real-time sync (frontend)
+- [ ] UI polish
