@@ -43,6 +43,13 @@
       "when": 1781404442210,
       "tag": "0005_living_cyclops",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1781985296752,
+      "tag": "0006_fancy_exiles",
+      "breakpoints": true
     }
   ]
 }

@@ -1,4 +1,5 @@
-import { sqliteTable, text, integer, unique } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, unique, index } from "drizzle-orm/sqlite-core";
+import { desc } from "drizzle-orm";
 
 export const users = sqliteTable("users", {
   id: text("id").primaryKey(), // Discord user ID
@@ -33,7 +34,14 @@ export const songs = sqliteTable("songs", {
   playlistId: text("playlist_id"),
   playlistTitle: text("playlist_title"),
   createdAt: integer("created_at").$defaultFn(() => Math.floor(Date.now() / 1000)),
-});
+}, (t) => [
+  // Hot path: WHERE room_id = ? ORDER BY votes DESC, created_at (the /songs poll,
+  // auto-advance, and the queue command). DESC on votes is required, or SQLite
+  // still builds a temp b-tree for the ORDER BY.
+  index("songs_room_votes_created_idx").on(t.roomId, desc(t.votes), t.createdAt),
+  // skip / next / playlist-skip filter by room + played.
+  index("songs_room_played_idx").on(t.roomId, t.played),
+]);
 
 export const votes = sqliteTable(
   "votes",
@@ -47,7 +55,12 @@ export const votes = sqliteTable(
       .references(() => users.id),
     createdAt: integer("created_at").$defaultFn(() => Math.floor(Date.now() / 1000)),
   },
-  (t) => [unique().on(t.songId, t.userId)]
+  (t) => [
+    unique().on(t.songId, t.userId),
+    // The /songs poll looks up a user's votes by user_id alone, which the
+    // composite unique index (song_id first) can't serve.
+    index("votes_user_id_idx").on(t.userId),
+  ]
 );
 
 export type User = typeof users.$inferSelect;
