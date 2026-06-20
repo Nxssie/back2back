@@ -12,8 +12,5 @@
     "db:generate": "bun --filter server db:generate",
     "db:push": "bun --filter server db:push",
     "test": "bun test"
-  },
-  "dependencies": {
-    "@discordjs/opus": "^0.10.0"
   }
 }

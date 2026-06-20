@@ -4,14 +4,12 @@
   "workspaces": {
     "": {
       "name": "back2back",
-      "dependencies": {
-        "@discordjs/opus": "^0.10.0",
-      },
     },
     "packages/server": {
       "name": "server",
       "version": "0.1.0",
       "dependencies": {
+        "@discordjs/opus": "^0.10.0",
         "@discordjs/voice": "^0.19.2",
         "@hono/node-server": "^1.14.0",
         "@libsql/client": "^0.14.0",
