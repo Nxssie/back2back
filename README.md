@@ -95,22 +95,70 @@ Or use the convenience script:
 - `/queue` — Show the current queue
 - `/reset` — Reset played songs
 
-## Deploy (Coolify)
+## Deploy (Coolify + Cloudflare Tunnel)
+
+Deployed as a **Docker Compose** resource in Coolify, with a **Cloudflare Tunnel**
+terminating TLS at the edge (no public ports open on the host). Coolify's Traefik
+only serves HTTP and routes by `Host`; it must **not** request a Let's Encrypt
+certificate. The compose declares no Traefik labels and no custom networks on
+purpose — Coolify generates the router and the per-stack network from the UI
+domain. Do not re-add them.
+
+### 1. Create the resource
 
 ```bash
-# 1. Push to your repo
-git push
-
-# 2. In Coolify, create a new Docker Compose app
-# 3. Point it to docker-compose.yml
-# 4. Add environment variables:
-#    - DISCORD_TOKEN=your_token
-#    - DISCORD_CLIENT_ID=your_id
-#    - DISCORD_CLIENT_SECRET=your_secret
-#    - DISCORD_REDIRECT_URI=https://your-domain/auth/discord/callback
-#    - FRONTEND_URL=https://your-domain
-#    - JWT_SECRET=$(openssl rand -hex 32)
+git push   # Coolify deploys from the repo
 ```
+
+In Coolify: **+ New → Docker Compose**, point it at this repo / `docker-compose.yml`.
+The domain goes on the **`web`** service only — `server` is internal (reached
+through nginx in the web image, never published to the host).
+
+### 2. Environment variables
+
+Coolify auto-detects the `${VAR}` placeholders from the compose and lists them;
+just fill in the values:
+
+| Variable | Value | Notes |
+|---|---|---|
+| `DISCORD_TOKEN` | bot token | mark **Is Secret?** |
+| `DISCORD_CLIENT_ID` | application id | |
+| `DISCORD_CLIENT_SECRET` | client secret | mark **Is Secret?** |
+| `DISCORD_REDIRECT_URI` | `https://b2b.nxssie.dev/auth/discord/callback` | public origin, **https** |
+| `FRONTEND_URL` | `https://b2b.nxssie.dev` | public origin, no trailing slash |
+| `JWT_SECRET` | `openssl rand -hex 32` | mark **Is Secret?**; server refuses to boot without a strong one |
+| `ADMIN_DISCORD_IDS` | comma-separated ids | optional |
+| `ROOM_TTL_HOURS` | `24` | optional |
+
+### 3. Ingress: Coolify domain as HTTP, TLS via Cloudflare
+
+- Coolify → `web` service → **Domains**: `http://b2b.nxssie.dev` (**`http://`**, not
+  `https://`). This stops Traefik from requesting a Let's Encrypt cert and from
+  adding an http→https redirect (which would loop behind Cloudflare).
+- Only the *Domains* field is `http://` — `FRONTEND_URL` and `DISCORD_REDIRECT_URI`
+  stay **`https://`** (that is the public scheme the browser sees).
+- Cloudflare Zero Trust → Networks → Tunnels → your tunnel → **Public Hostname**
+  for `b2b.nxssie.dev` → Service `HTTP` → `http://localhost:80` (Traefik /
+  coolify-proxy on the host; use the host LAN IP if `cloudflared` runs elsewhere).
+  Leave the HTTP Host Header empty so the original host is preserved for Traefik.
+- Cloudflare → SSL/TLS → **Full**.
+
+### 4. Discord OAuth
+
+Discord Developer Portal → your app → OAuth2 → Redirects → add **exactly**
+`https://b2b.nxssie.dev/auth/discord/callback` (https, no port, no trailing slash).
+It must byte-match `DISCORD_REDIRECT_URI`.
+
+### 5. Smoke test
+
+```bash
+curl -I https://b2b.nxssie.dev/             # 200, serves the SPA
+curl -s https://b2b.nxssie.dev/api/auth/me   # {"user":null}
+```
+
+- **502 / 523** → the tunnel can't reach Traefik on `:80` (check the Public Hostname
+  service URL).
+- **Redirect loop** → the Domains field is still `https://` (must be `http://`).
 
 ## TODO
 
