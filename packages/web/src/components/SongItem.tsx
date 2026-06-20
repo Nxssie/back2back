@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, memo } from "react";
 import Glyph from "./Glyph";
 
 interface Song {
@@ -24,7 +24,7 @@ interface SongItemProps {
   onPreview?: (song: Song) => void;
 }
 
-export default function SongItem({ song, isVoted, canDelete, onVote, onDelete, onPreview }: SongItemProps) {
+function SongItem({ song, isVoted, canDelete, onVote, onDelete, onPreview }: SongItemProps) {
   const [confirmDelete, setConfirmDelete] = useState(false);
 
   return (
@@ -110,3 +110,8 @@ export default function SongItem({ song, isVoted, canDelete, onVote, onDelete, o
     </div>
   );
 }
+
+// Memoized: the queue re-renders on every 4s poll and on unrelated Room state
+// changes; with stable props (memoized derivations + useCallback handlers in
+// Room) each row only re-renders when its own song/vote state actually changes.
+export default memo(SongItem);

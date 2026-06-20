@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import YouTube from "react-youtube";
 import Navbar from "../components/Navbar";
@@ -6,8 +6,8 @@ import SongItem from "../components/SongItem";
 import Waveform from "../components/Waveform";
 import Glyph from "../components/Glyph";
 import ReticleCorners from "../components/ReticleCorners";
+import LyricsPanel from "../components/LyricsPanel";
 import { useAuth } from "../hooks/useAuth";
-import { fetchLyrics, getCurrentLineIndex, type LrcLine } from "../lib/lyrics";
 
 interface Song {
   id: number;
@@ -59,22 +59,31 @@ export default function Room() {
   const [searching, setSearching] = useState(false);
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Lyrics state
+  // When the currently-playing track started (server clock), for lyric sync.
   const [currentSongStartedAt, setCurrentSongStartedAt] = useState<number | null>(null);
-  const [lyricsLines, setLyricsLines] = useState<LrcLine[]>([]);
-  const [lyricsPlain, setLyricsPlain] = useState<string | null>(null);
-  const [lyricsLoading, setLyricsLoading] = useState(false);
-  const [lyricsOpen, setLyricsOpen] = useState(false);
-  const [currentLineIdx, setCurrentLineIdx] = useState(-1);
-  const lyricsContainerRef = useRef<HTMLDivElement>(null);
 
-  const fetchSongs = async () => {
+  // Signatures of the last applied payload, so an unchanged 4s poll doesn't
+  // rebuild a new array and re-render the whole queue.
+  const songsSigRef = useRef("");
+  const votesSigRef = useRef("");
+  const fetchSongs = useCallback(async () => {
     if (!id) return;
     try {
       const res = await fetch(`/api/rooms/${id}/songs`, { credentials: "include" });
       const data = await res.json();
-      setSongs(data.songs || []);
-      setUserVotes(data.userVotes || []);
+      const incoming: Song[] = data.songs || [];
+      const sig = incoming.map((s) => `${s.id}:${s.votes}:${s.played ? 1 : 0}:${s.title ?? ""}`).join("|");
+      if (sig !== songsSigRef.current) {
+        songsSigRef.current = sig;
+        setSongs(incoming);
+      }
+      const incomingVotes: number[] = data.userVotes || [];
+      const votesSig = incomingVotes.join(",");
+      if (votesSig !== votesSigRef.current) {
+        votesSigRef.current = votesSig;
+        setUserVotes(incomingVotes);
+      }
+      // Primitive setState with an unchanged value is a no-op re-render in React.
       setPresentCount(data.presentCount ?? 1);
       setCurrentSongStartedAt(data.currentSongStartedAt ?? null);
     } catch {
@@ -82,13 +91,13 @@ export default function Room() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [id]);
 
   useEffect(() => {
     fetchSongs();
     const interval = setInterval(fetchSongs, 4000);
     return () => clearInterval(interval);
-  }, [id]);
+  }, [fetchSongs]);
 
   useEffect(() => {
     if (!id || !user) return;
@@ -118,54 +127,9 @@ export default function Room() {
     };
   }, [id, user]);
 
-  // Fetch lyrics when the current song changes
-  const currentSong = songs.find((s) => !s.played);
-  useEffect(() => {
-    if (!currentSong?.title) {
-      setLyricsLines([]);
-      setLyricsPlain(null);
-      return;
-    }
-    let cancelled = false;
-    setLyricsLoading(true);
-    setLyricsLines([]);
-    setLyricsPlain(null);
-    setCurrentLineIdx(-1);
-    fetchLyrics(currentSong.title, currentSong.uploader).then((result) => {
-      if (cancelled) return;
-      setLyricsLines(result?.lines ?? []);
-      setLyricsPlain(result?.plain ?? null);
-      setLyricsLoading(false);
-    });
-    return () => { cancelled = true; };
-  }, [currentSong?.id]);
-
-  // Tick elapsed time to keep current lyric line in sync
-  useEffect(() => {
-    if (!lyricsLines.length || !currentSongStartedAt || !lyricsOpen) return;
-    const tick = () => {
-      const elapsed = Date.now() - currentSongStartedAt;
-      setCurrentLineIdx(getCurrentLineIndex(lyricsLines, elapsed));
-    };
-    tick();
-    const id = setInterval(tick, 250);
-    return () => clearInterval(id);
-  }, [lyricsLines, currentSongStartedAt, lyricsOpen]);
-
-  // Scroll the lyrics container to keep the active line centered — never touches the outer sidebar
-  useEffect(() => {
-    if (currentLineIdx < 0 || !lyricsContainerRef.current) return;
-    const container = lyricsContainerRef.current;
-    const activeLine = container.children[currentLineIdx] as HTMLElement | null;
-    if (!activeLine) return;
-    // Use getBoundingClientRect so the position is always relative to the visible viewport,
-    // then adjust for the container's current scrollTop to get the document-relative offset.
-    const containerRect = container.getBoundingClientRect();
-    const lineRect = activeLine.getBoundingClientRect();
-    const lineTop = lineRect.top - containerRect.top + container.scrollTop;
-    const target = lineTop + lineRect.height / 2 - container.clientHeight / 2;
-    container.scrollTop = Math.max(0, target);
-  }, [currentLineIdx]);
+  // The first unplayed song is "now playing". Memoized so it isn't recomputed on
+  // every unrelated re-render (lyrics live in their own component now).
+  const currentSong = useMemo(() => songs.find((s) => !s.played), [songs]);
 
   const leaveRoom = () => navigate("/");
 
@@ -211,7 +175,8 @@ export default function Room() {
     }
   };
 
-  const vote = async (songId: number) => {
+  // Stable identities so memoized SongItems don't re-render when Room re-renders.
+  const vote = useCallback(async (songId: number) => {
     if (!id || !user) return;
     try {
       const res = await fetch(`/api/rooms/${id}/songs/${songId}/vote`, {
@@ -229,9 +194,9 @@ export default function Room() {
       setError("ERR_03: vote_failed;");
       setTimeout(() => setError(null), 3000);
     }
-  };
+  }, [id, user, fetchSongs]);
 
-  const deleteSong = async (songId: number) => {
+  const deleteSong = useCallback(async (songId: number) => {
     if (!id) return;
     try {
       const res = await fetch(`/api/rooms/${id}/songs/${songId}`, {
@@ -243,7 +208,7 @@ export default function Room() {
       setError("ERR_04: delete_failed;");
       setTimeout(() => setError(null), 3000);
     }
-  };
+  }, [id, fetchSongs]);
 
   useEffect(() => {
     if (inputMode !== "search" || !searchQuery.trim()) {
@@ -363,8 +328,8 @@ export default function Room() {
     }
   };
 
-  const pendingSongs = songs.filter((s) => !s.played).slice(1);
-  const playedSongs = songs.filter((s) => s.played);
+  const pendingSongs = useMemo(() => songs.filter((s) => !s.played).slice(1), [songs]);
+  const playedSongs = useMemo(() => songs.filter((s) => s.played), [songs]);
   const skipThreshold = Math.max(1, Math.ceil(presentCount / 2));
   const canSkip = !!currentSong && (
     currentSong.votes >= skipThreshold || user?.id === currentSong.addedByUserId
@@ -376,7 +341,7 @@ export default function Room() {
     | { type: "song"; song: Song }
     | { type: "playlist"; playlistId: string; playlistTitle: string; songs: Song[] };
 
-  const pendingGroups = pendingSongs.reduce<QueueGroup[]>((acc, song) => {
+  const pendingGroups = useMemo<QueueGroup[]>(() => pendingSongs.reduce<QueueGroup[]>((acc, song) => {
     if (song.playlistId) {
       const last = acc[acc.length - 1];
       if (last?.type === "playlist" && last.playlistId === song.playlistId) {
@@ -388,7 +353,7 @@ export default function Room() {
       acc.push({ type: "song", song });
     }
     return acc;
-  }, []);
+  }, []), [pendingSongs]);
 
   return (
     <div className="min-h-screen flex flex-col bg-ps-ink-900">
@@ -563,54 +528,14 @@ export default function Room() {
                       </button>
                     </div>
 
-                    {/* Lyrics section */}
-                    {(lyricsLoading || lyricsLines.length > 0 || lyricsPlain) && (
-                      <div className="border-t border-white/10">
-                        <button
-                          onClick={() => setLyricsOpen((o) => !o)}
-                          className="w-full flex items-center justify-between px-5 py-2.5 text-[9px] font-mono tracking-[0.14em] uppercase text-ps-steel-400 hover:text-ps-iris-lilac transition-colors"
-                        >
-                          <span>_lyrics;</span>
-                          <span className="text-ps-steel-400/60">{lyricsOpen ? "▲" : "▼"}</span>
-                        </button>
-
-                        {lyricsOpen && (
-                          <div
-                            ref={lyricsContainerRef}
-                            className="px-5 pb-5 max-h-64 overflow-y-auto space-y-0.5"
-                            style={{ scrollbarWidth: "none" }}
-                          >
-                            {lyricsLoading ? (
-                              <p className="text-[10px] font-mono text-ps-steel-400/50 animate-pulse">_searching_lyrics;</p>
-                            ) : lyricsLines.length > 0 ? (
-                              lyricsLines.map((line, i) => {
-                                const isActive = i === currentLineIdx;
-                                const isPast = i < currentLineIdx;
-                                return (
-                                  <div
-                                    key={i}
-                                    className={[
-                                      "text-[11px] font-mono leading-relaxed py-0.5 transition-all duration-300",
-                                      isActive
-                                        ? "text-ps-iris-cyan font-semibold scale-[1.02] origin-left"
-                                        : isPast
-                                        ? "text-ps-steel-400/40"
-                                        : "text-ps-steel-400/70",
-                                    ].join(" ")}
-                                  >
-                                    {line.text}
-                                  </div>
-                                );
-                              })
-                            ) : (
-                              <div className="text-[10px] font-mono text-ps-steel-400/60 leading-relaxed whitespace-pre-line">
-                                {lyricsPlain}
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    )}
+                    {/* Lyrics — owns its own state + 250ms sync tick so it
+                        never re-renders the queue. */}
+                    <LyricsPanel
+                      songId={currentSong.id}
+                      title={currentSong.title}
+                      uploader={currentSong.uploader}
+                      startedAt={currentSongStartedAt}
+                    />
 
                   </>
                 )}
@@ -810,7 +735,7 @@ export default function Room() {
                       canDelete={user?.id === group.song.addedByUserId}
                       onVote={vote}
                       onDelete={deleteSong}
-                      onPreview={(song) => setPreviewSong(song)}
+                      onPreview={setPreviewSong}
                     />
                   ) : (() => {
                     const isCollapsed = collapsedPlaylists.has(group.playlistId);
@@ -861,7 +786,7 @@ export default function Room() {
                                 canDelete={user?.id === song.addedByUserId}
                                 onVote={vote}
                                 onDelete={deleteSong}
-                                onPreview={(song) => setPreviewSong(song)}
+                                onPreview={setPreviewSong}
                               />
                             ))}
                           </div>

@@ -1,4 +1,6 @@
-export default function Waveform({ isPlaying = false }: { isPlaying?: boolean }) {
+import { memo } from "react";
+
+function Waveform({ isPlaying = false }: { isPlaying?: boolean }) {
   const bars = 32;
 
   return (
@@ -25,3 +27,7 @@ export default function Waveform({ isPlaying = false }: { isPlaying?: boolean })
     </div>
   );
 }
+
+// Memoized: its only prop is a constant, so it renders once instead of on every
+// Room re-render (4s poll, lyrics tick, keystrokes).
+export default memo(Waveform);
