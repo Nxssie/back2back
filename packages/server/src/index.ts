@@ -89,6 +89,21 @@ function isAdmin(user: User | null): boolean {
   return !!user && ADMIN_DISCORD_IDS.has(user.id);
 }
 
+// Optional yt-dlp hardening for servers whose IP YouTube rate-limits/blocks
+// (datacenter IPs frequently hit "Sign in to confirm you're not a bot" / 403,
+// which makes tracks fail to extract and end almost instantly). Set these in the
+// environment — no code change needed — to recover playback:
+//   YTDLP_COOKIES=/app/data/cookies.txt          Netscape cookie jar from a logged-in session
+//   YTDLP_EXTRACTOR_ARGS=youtube:player_client=default,mweb
+//   YTDLP_DOWNLOADER=ffmpeg                        more robust for fragmented/SABR streams
+const YTDLP_BASE_ARGS: string[] = [
+  ...(process.env.YTDLP_COOKIES ? ["--cookies", process.env.YTDLP_COOKIES] : []),
+  ...(process.env.YTDLP_EXTRACTOR_ARGS ? ["--extractor-args", process.env.YTDLP_EXTRACTOR_ARGS] : []),
+];
+const YTDLP_DOWNLOAD_ARGS: string[] = process.env.YTDLP_DOWNLOADER
+  ? ["--downloader", process.env.YTDLP_DOWNLOADER]
+  : [];
+
 // --- State (in-memory; this is a deliberately single-instance service) ---
 const players = new Map<string, AudioPlayer>();
 const connections = new Map<string, VoiceConnection>();
@@ -97,6 +112,26 @@ const currentTracks = new Map<
   string,
   { songId: number; videoId: string; startedAt: number; cleanup: () => void }
 >();
+
+// Auto-advance failure control. A track that goes Idle far sooner than it could
+// have played almost certainly never produced audio (yt-dlp/ffmpeg failed). With
+// a failing queue (e.g. a 54-song playlist on a blocked IP) the Idle handler
+// would otherwise advance instantly through every entry, spawning a yt-dlp +
+// ffmpeg storm that pins the CPU. So we count consecutive fast failures per
+// guild, back off before retrying, and stop after a cap.
+const consecutiveFailures = new Map<string, number>();
+const pendingAdvance = new Map<string, ReturnType<typeof setTimeout>>();
+// guildIds whose upcoming Idle was caused by an intentional user skip, so it is
+// not mis-counted as a playback failure.
+const recentSkip = new Set<string>();
+// Per-guild lock so two advances can't overlap (the POST handlers fire
+// playNextFromRoom without awaiting, and currentTracks isn't set until after an
+// up-to-15s getVideoInfo await — without this, two concurrent advances each
+// spawn yt-dlp+ffmpeg and the first pair is orphaned/leaked).
+const advancing = new Set<string>();
+const FAST_FAIL_MS = 5_000;
+const MAX_CONSECUTIVE_FAILURES = 5;
+const failureBackoffMs = (n: number) => [3_000, 8_000, 15_000, 30_000][n - 1] ?? 30_000;
 
 // --- Discord Bot ---
 const discord = new Client({
@@ -176,9 +211,16 @@ function createAudioStream(videoId: string): {
 
   const ytdlp = spawn(
     "yt-dlp",
-    ["-f", "bestaudio", "--no-playlist", "-o", "-", url],
-    { stdio: ["ignore", "pipe", "ignore"] }
+    ["-f", "bestaudio", "--no-playlist", ...YTDLP_BASE_ARGS, ...YTDLP_DOWNLOAD_ARGS, "-o", "-", url],
+    // stderr is piped (not ignored) so an extraction failure — 403, "Sign in to
+    // confirm you're not a bot", "forcing SABR" — is logged instead of silently
+    // producing an empty stream that ends the track after ~2s.
+    { stdio: ["ignore", "pipe", "pipe"] }
   );
+  let ytdlpErr = "";
+  ytdlp.stderr.on("data", (chunk) => {
+    if (ytdlpErr.length < 4000) ytdlpErr += chunk.toString();
+  });
 
   const ffmpeg = spawn(
     ffmpegStatic!,
@@ -209,8 +251,12 @@ function createAudioStream(videoId: string): {
   // and close naturally — killing it here would cut the end of the track.
   // Only kill ffmpeg if yt-dlp crashed (non-zero exit).
   ytdlp.on("close", (code) => {
-    if (code !== 0 && !ffmpeg.killed) {
-      try { ffmpeg.kill("SIGKILL"); } catch {}
+    if (code !== 0) {
+      const tail = ytdlpErr.trim().split("\n").slice(-3).join(" | ");
+      console.error(`❌ yt-dlp exited ${code} for ${videoId}: ${tail || "(no stderr)"}`);
+      if (!ffmpeg.killed) {
+        try { ffmpeg.kill("SIGKILL"); } catch {}
+      }
     }
   });
 
@@ -231,7 +277,7 @@ function getVideoInfo(videoId: string): Promise<{ title: string; uploader: strin
   // shell — this closes the command-injection sink that string interpolation
   // into `yt-dlp --get-title "..."` opened.
   return new Promise((resolve) => {
-    const proc = spawn("yt-dlp", ["--get-title", "--no-warnings", url], {
+    const proc = spawn("yt-dlp", ["--get-title", "--no-warnings", ...YTDLP_BASE_ARGS, url], {
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 15000,
     });
@@ -245,6 +291,14 @@ function getVideoInfo(videoId: string): Promise<{ title: string; uploader: strin
 // Fully release a guild's playback: kill child processes, stop the player,
 // destroy the voice connection, and drop all per-guild state. Idempotent.
 function teardownGuild(guildId: string) {
+  // Cancel any scheduled backoff advance and drop per-guild failure/skip state.
+  const pending = pendingAdvance.get(guildId);
+  if (pending) { clearTimeout(pending); pendingAdvance.delete(guildId); }
+  consecutiveFailures.delete(guildId);
+  recentSkip.delete(guildId);
+  // Drop the room mapping BEFORE stopping the player: stop() fires Idle, and the
+  // Idle handler must not find a room to advance into while we're tearing down.
+  guildRoomMap.delete(guildId);
   const track = currentTracks.get(guildId);
   track?.cleanup();
   currentTracks.delete(guildId);
@@ -255,7 +309,6 @@ function teardownGuild(guildId: string) {
     try { conn.destroy(); } catch {}
   }
   connections.delete(guildId);
-  guildRoomMap.delete(guildId);
 }
 
 // --- Voice helpers ---
@@ -266,8 +319,9 @@ function setupPlayer(guildId: string): AudioPlayer {
   player = createAudioPlayer();
 
   player.on(AudioPlayerStatus.Idle, async () => {
-    console.log(`⏹️ Track finished in guild ${guildId}`);
     const track = currentTracks.get(guildId);
+    const playedMs = track ? Date.now() - track.startedAt : 0;
+    const wasSkip = recentSkip.delete(guildId); // consume the skip marker, if any
     if (track) {
       track.cleanup();
       await db.update(songs).set({ played: true }).where(eq(songs.id, track.songId)).run();
@@ -275,9 +329,40 @@ function setupPlayer(guildId: string): AudioPlayer {
     }
 
     const roomId = guildRoomMap.get(guildId);
-    if (roomId) {
+    if (!roomId) return;
+
+    // Healthy advance: an intentional user skip, or a track that actually played
+    // for a while. Reset the failure streak and move on immediately.
+    if (wasSkip || !track || playedMs >= FAST_FAIL_MS) {
+      consecutiveFailures.set(guildId, 0);
+      console.log(`⏹️ Track finished in guild ${guildId} (${(playedMs / 1000).toFixed(0)}s)`);
       await playNextFromRoom(roomId, guildId);
+      return;
     }
+
+    // Ended far too soon to have produced audio — almost certainly an extraction
+    // failure (yt-dlp blocked/outdated). Back off so a queue of unplayable tracks
+    // can't spawn a yt-dlp/ffmpeg storm by advancing instantly through every one.
+    const fails = (consecutiveFailures.get(guildId) ?? 0) + 1;
+    consecutiveFailures.set(guildId, fails);
+    console.warn(
+      `⚠️ Track in guild ${guildId} ended after ${playedMs}ms — likely extraction failure (${fails}/${MAX_CONSECUTIVE_FAILURES})`
+    );
+
+    if (fails >= MAX_CONSECUTIVE_FAILURES) {
+      console.error(
+        `⛔ ${MAX_CONSECUTIVE_FAILURES} consecutive playback failures in guild ${guildId}; stopping auto-advance. Check yt-dlp (IP blocked / outdated?).`
+      );
+      consecutiveFailures.set(guildId, 0);
+      return;
+    }
+
+    const delay = failureBackoffMs(fails);
+    const timer = setTimeout(() => {
+      pendingAdvance.delete(guildId);
+      void playNextFromRoom(roomId, guildId);
+    }, delay);
+    pendingAdvance.set(guildId, timer);
   });
 
   player.on("error", (error) => {
@@ -324,6 +409,19 @@ async function connectToVoiceChannel(
 
 // --- Play next song ---
 async function playNextFromRoom(roomId: string, guildId: string) {
+  // Serialize advances per guild: the POST handlers fire this without awaiting,
+  // and currentTracks isn't set until after the getVideoInfo await, so two
+  // callers could otherwise both spawn yt-dlp+ffmpeg and orphan the first pair.
+  if (advancing.has(guildId)) return;
+  advancing.add(guildId);
+  try {
+    await playNextFromRoomInner(roomId, guildId);
+  } finally {
+    advancing.delete(guildId);
+  }
+}
+
+async function playNextFromRoomInner(roomId: string, guildId: string) {
   const allSongs = await db
     .select()
     .from(songs)
@@ -376,7 +474,12 @@ async function playNextFromRoom(roomId: string, guildId: string) {
 // --- Hono API ---
 const app = new Hono();
 
-app.use("*", logger());
+// Skip request logging for the high-frequency songs poll: every connected client
+// hits it every ~4s, so logging it floods stdout and the json-file log driver.
+const requestLogger = logger();
+app.use("*", (c, next) =>
+  c.req.method === "GET" && /\/songs$/.test(c.req.path) ? next() : requestLogger(c, next)
+);
 app.use(
   "*",
   cors({
@@ -421,7 +524,7 @@ async function resolvePlaylist(
   return new Promise((resolve) => {
     const proc = spawn(
       "yt-dlp",
-      ["--flat-playlist", "--dump-single-json", "--no-warnings", url],
+      ["--flat-playlist", "--dump-single-json", "--no-warnings", ...YTDLP_BASE_ARGS, url],
       { stdio: ["ignore", "pipe", "ignore"], timeout: 30000 }
     );
     let output = "";
@@ -638,10 +741,13 @@ app.get("/api/rooms/:id/songs", async (c) => {
 
   let userVotes: number[] = [];
   if (user) {
+    // Scope to this room's songs (join) so the result is bounded by the room,
+    // not the user's entire vote history across every room they've ever used.
     const userVoteRecords = await db
-      .select()
+      .select({ songId: votes.songId })
       .from(votes)
-      .where(and(eq(votes.userId, user.id)))
+      .innerJoin(songs, eq(votes.songId, songs.id))
+      .where(and(eq(votes.userId, user.id), eq(songs.roomId, id)))
       .all();
     userVotes = userVoteRecords.map((v) => v.songId);
   }
@@ -786,6 +892,7 @@ app.post("/api/rooms/:id/skip", async (c) => {
 
   for (const [guildId, roomId] of guildRoomMap) {
     if (roomId === id) {
+      recentSkip.add(guildId);
       players.get(guildId)?.stop();
       break;
     }
@@ -820,7 +927,10 @@ app.post("/api/rooms/:id/playlists/:playlistId/skip", async (c) => {
   for (const [guildId, roomId] of guildRoomMap) {
     if (roomId === id) {
       const track = currentTracks.get(guildId);
-      if (track && ids.includes(track.songId)) players.get(guildId)?.stop();
+      if (track && ids.includes(track.songId)) {
+        recentSkip.add(guildId);
+        players.get(guildId)?.stop();
+      }
       break;
     }
   }
@@ -917,7 +1027,7 @@ app.get("/api/search", async (c) => {
   const results = await new Promise<SearchResult[]>((resolve) => {
     const proc = spawn(
       "yt-dlp",
-      [`ytsearch${n}:${q}`, "--dump-json", "--flat-playlist", "--no-warnings"],
+      [`ytsearch${n}:${q}`, "--dump-json", "--flat-playlist", "--no-warnings", ...YTDLP_BASE_ARGS],
       { stdio: ["ignore", "pipe", "ignore"] }
     );
 
@@ -1184,6 +1294,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       if (!guildId) return;
       const player = players.get(guildId);
       if (player) {
+        recentSkip.add(guildId);
         player.stop();
       }
       await interaction.reply("⏭️ Skipped");
