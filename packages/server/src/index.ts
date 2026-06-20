@@ -1299,7 +1299,11 @@ setTimeout(() => void runMaintenance(), 30_000); // once, shortly after boot
 // A single unhandled error in an event handler must not take down the whole
 // process (bot + API + every room). Log loudly and keep serving.
 process.on("unhandledRejection", (reason) => console.error("unhandledRejection:", reason));
-process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
+process.on("uncaughtException", (err) => {
+  // EPIPE means a client disconnected mid-response; harmless, don't crash.
+  if ((err as NodeJS.ErrnoException).code === "EPIPE") return;
+  console.error("uncaughtException:", err);
+});
 
 // --- Start ---
 if (DISCORD_TOKEN) {
