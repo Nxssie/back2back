@@ -1,0 +1,64 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: packages/server/Dockerfile
+    # Internal only — reached through the web nginx proxy, never published to the host.
+    expose:
+      - "3001"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - NODE_ENV=production
+      # SQLite file inside the mounted volume so data survives redeploys.
+      - DATABASE_URL=file:/app/data/data.db
+      - DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID}
+      - DISCORD_CLIENT_SECRET=${DISCORD_CLIENT_SECRET}
+      - DISCORD_REDIRECT_URI=${DISCORD_REDIRECT_URI}
+      # Public origin for post-login redirects, e.g. https://b2b.nxssie.dev
+      - FRONTEND_URL=${FRONTEND_URL}
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      # Required in prod: the server refuses to boot without a strong secret.
+      - JWT_SECRET=${JWT_SECRET}
+      - ADMIN_DISCORD_IDS=${ADMIN_DISCORD_IDS:-}
+      - ROOM_TTL_HOURS=${ROOM_TTL_HOURS:-24}
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: "1.5"
+    healthcheck:
+      # oven/bun image has no curl; use bun's fetch against /health.
+      test: ["CMD", "bun", "-e", "fetch('http://localhost:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  web:
+    build:
+      context: .
+      dockerfile: packages/web/Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 128m
+    cpus: "0.5"
+    healthcheck:
+      # nginx:alpine has busybox wget.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

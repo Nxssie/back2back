@@ -1,0 +1,12 @@
+node_modules/
+dist/
+data.db
+data/
+*.db-shm
+*.db-wal
+.env
+.env.local
+*.log
+.DS_Store
+.idea/
+searchtest.ts

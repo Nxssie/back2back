@@ -1,0 +1,143 @@
+@import "./styles/printstream.css";
+@import "tailwindcss";
+
+@theme {
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+  --font-display: 'Space Grotesk', 'Inter Tight', system-ui, sans-serif;
+  --font-body: 'Inter Tight', system-ui, -apple-system, sans-serif;
+
+  --color-ps-white: #FFFFFF;
+  --color-ps-paper: #F4F4F2;
+  --color-ps-pearl-100: #EDEDEF;
+  --color-ps-pearl-200: #DDDDE1;
+  --color-ps-pearl-300: #C3C3C8;
+  --color-ps-steel-400: #8A8A90;
+  --color-ps-steel-500: #5A5A62;
+  --color-ps-graphite-600: #2F2F36;
+  --color-ps-graphite-700: #1A1A1F;
+  --color-ps-ink-800: #0D0D11;
+  --color-ps-ink-900: #050507;
+
+  --color-ps-iris-cyan: #B6E8F2;
+  --color-ps-iris-lilac: #D5C9F0;
+  --color-ps-iris-rose: #F2C9DA;
+  --color-ps-iris-mint: #CFE9DB;
+
+  --color-ps-signal-caution: #E8D26B;
+  --color-ps-signal-danger: #D2644D;
+  --color-ps-signal-ok: #7FA58A;
+
+  /* Foregrounds on dark surfaces — registered so the `text-ps-fg-inv-*`
+     utilities actually resolve (they were referenced but never defined). */
+  --color-ps-fg-inv-1: #FFFFFF;
+  --color-ps-fg-inv-2: #DDDDE1;
+  --color-ps-fg-inv-3: #8A8A90;
+}
+
+/* NOTE: no global `* { margin:0; padding:0 }` reset here. Tailwind v4's
+   preflight already resets margins + box-sizing inside a cascade layer, so
+   utilities win. An unlayered `*` reset would beat every `p-*`/`m-*`/`space-y-*`
+   utility (unlayered always outranks @layer), gluing everything to the edges. */
+
+body {
+  background-color: var(--ps-ink-900);
+  /* Faint dotted measurement grid — "complex minimalism", barely there. */
+  background-image: radial-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+  background-size: 22px 22px;
+  background-position: -1px -1px;
+  color: var(--ps-fg-inv-1);
+  font-family: var(--ps-font-body);
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* Scrollbar — thin, printed */
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: var(--ps-graphite-700);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--ps-graphite-600);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--ps-steel-500);
+}
+
+/* Animations */
+@keyframes ps-waveform {
+  0%, 100% { height: 20%; }
+  50% { height: 80%; }
+}
+
+@keyframes ps-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+@keyframes ps-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* PrintStream dark-mode overrides */
+.ps-surface {
+  background: var(--ps-graphite-700);
+  border: 1px solid var(--ps-border-inv);
+}
+
+.ps-surface-raised {
+  background: var(--ps-graphite-600);
+  border: 1px solid var(--ps-border-inv);
+}
+
+/* Reticle corner brackets on focus */
+.ps-reticle-focus:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--ps-iris-cyan);
+}
+.ps-reticle-focus:focus-visible::before,
+.ps-reticle-focus:focus-visible::after {
+  content: "";
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border: 1px solid var(--ps-iris-cyan);
+}
+.ps-reticle-focus:focus-visible::before {
+  top: -2px;
+  left: -2px;
+  border-right: 0;
+  border-bottom: 0;
+}
+.ps-reticle-focus:focus-visible::after {
+  bottom: -2px;
+  right: -2px;
+  border-left: 0;
+  border-top: 0;
+}
+
+/* Pearlescent shimmer underline on hover */
+.ps-shimmer-underline {
+  position: relative;
+}
+.ps-shimmer-underline::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--ps-pearl-gradient);
+  opacity: 0;
+  transition: opacity var(--ps-dur-fast) var(--ps-ease-print);
+}
+.ps-shimmer-underline:hover::after {
+  opacity: 1;
+}

@@ -1,0 +1,21 @@
+# Dependencies — installed fresh inside the image via bun install
+node_modules
+**/node_modules
+
+# Build artifacts — the web image rebuilds dist/, the server runs from source
+dist
+**/dist
+
+# Local SQLite DB and secrets must never leak into the image
+*.db
+**/*.db
+.env
+.env.local
+**/.env
+**/.env.local
+
+# Misc
+*.log
+.git
+.gitignore
+.DS_Store

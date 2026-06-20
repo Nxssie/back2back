@@ -1,0 +1,314 @@
+/* =============================================================
+   PRINTSTREAM DESIGN SYSTEM — Colors & Type
+   Monochromatic pearlescent / code-language aesthetic.
+   ============================================================= */
+
+/* ---------- Fonts ----------
+   Primary mono (UI, code, numerics): JetBrains Mono
+   Display (XXXY / B-codes): Space Grotesk (heavy weight)
+   Body: Inter Tight — kept functional, minimalist complex
+   ---------------------------------------------------------- */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=Inter+Tight:wght@300;400;500;600;700&display=swap');
+
+:root {
+  /* ===== CORE MONOCHROME — extreme contrast, pearlescent bias ===== */
+  --ps-white:          #FFFFFF;            /* inmaculate base */
+  --ps-paper:          #F4F4F2;            /* off-white, warm tint */
+  --ps-pearl-100:      #EDEDEF;            /* pearlescent shadow 1 */
+  --ps-pearl-200:      #DDDDE1;            /* pearlescent shadow 2 */
+  --ps-pearl-300:      #C3C3C8;            /* cooler mid */
+  --ps-steel-400:      #8A8A90;            /* printed gray */
+  --ps-steel-500:      #5A5A62;            /* body secondary */
+  --ps-graphite-600:   #2F2F36;            /* grip rubber */
+  --ps-graphite-700:   #1A1A1F;            /* chassis dark */
+  --ps-ink-800:        #0D0D11;            /* near black */
+  --ps-ink-900:        #050507;            /* deepest */
+
+  /* ===== PEARLESCENT / HOLOGRAPHIC ACCENTS =====
+     Used SPARINGLY — barcodes, lens flares, reticule shimmer.
+     Pastel iridescent trio: cyan → lilac → rose. */
+  --ps-iris-cyan:      #B6E8F2;
+  --ps-iris-lilac:     #D5C9F0;
+  --ps-iris-rose:      #F2C9DA;
+  --ps-iris-mint:      #CFE9DB;
+
+  /* Gradient — the pearlescent shimmer */
+  --ps-pearl-gradient: linear-gradient(
+    100deg,
+    var(--ps-iris-rose)  0%,
+    var(--ps-iris-lilac) 35%,
+    var(--ps-iris-cyan)  65%,
+    var(--ps-iris-mint)  100%
+  );
+  --ps-pearl-gradient-v: linear-gradient(
+    180deg,
+    var(--ps-iris-cyan)  0%,
+    var(--ps-iris-lilac) 50%,
+    var(--ps-iris-rose)  100%
+  );
+
+  /* ===== SEMANTIC (sparingly used — system stays monochromatic) ===== */
+  --ps-signal-caution: #E8D26B;   /* desaturated mustard */
+  --ps-signal-danger:  #D2644D;   /* faded terracotta */
+  --ps-signal-ok:      #7FA58A;   /* sage */
+
+  /* ===== FOREGROUNDS (on light surfaces) ===== */
+  --ps-fg-1:           var(--ps-ink-900);     /* primary text */
+  --ps-fg-2:           var(--ps-graphite-700);/* headlines / strong */
+  --ps-fg-3:           var(--ps-steel-500);   /* body secondary */
+  --ps-fg-4:           var(--ps-steel-400);   /* tertiary, meta */
+  --ps-fg-5:           var(--ps-pearl-300);   /* quiet divider text */
+
+  /* ===== FOREGROUNDS (on dark surfaces) ===== */
+  --ps-fg-inv-1:       var(--ps-white);
+  --ps-fg-inv-2:       var(--ps-pearl-200);
+  --ps-fg-inv-3:       var(--ps-steel-400);
+
+  /* ===== SURFACES ===== */
+  --ps-bg-page:        var(--ps-paper);
+  --ps-bg-card:        var(--ps-white);
+  --ps-bg-inset:       var(--ps-pearl-100);
+  --ps-bg-dark:        var(--ps-ink-900);
+  --ps-bg-dark-card:   var(--ps-graphite-700);
+  --ps-bg-grip:        var(--ps-graphite-600);
+
+  /* ===== BORDERS / HAIRLINES ===== */
+  --ps-border-hair:    #000000;              /* 1px printed line */
+  --ps-border-soft:    rgba(0,0,0,.12);
+  --ps-border-ghost:   rgba(0,0,0,.06);
+  --ps-border-inv:     rgba(255,255,255,.18);
+
+  /* ===== TYPE FAMILIES ===== */
+  --ps-font-mono:    'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+  --ps-font-display: 'Space Grotesk', 'Inter Tight', system-ui, sans-serif;
+  --ps-font-body:    'Inter Tight', system-ui, -apple-system, sans-serif;
+
+  /* ===== TYPE SCALE (minor-third, tight) ===== */
+  --ps-size-3xs:  10px;
+  --ps-size-2xs:  11px;
+  --ps-size-xs:   12px;
+  --ps-size-sm:   13px;
+  --ps-size-base: 15px;
+  --ps-size-md:   17px;
+  --ps-size-lg:   20px;
+  --ps-size-xl:   24px;
+  --ps-size-2xl:  32px;
+  --ps-size-3xl:  44px;
+  --ps-size-4xl:  64px;
+  --ps-size-5xl:  96px;
+
+  /* ===== WEIGHTS ===== */
+  --ps-weight-light:    300;
+  --ps-weight-regular:  400;
+  --ps-weight-medium:   500;
+  --ps-weight-semibold: 600;
+  --ps-weight-bold:     700;
+
+  /* ===== LINE HEIGHTS ===== */
+  --ps-lh-tight:  1.05;
+  --ps-lh-snug:   1.2;
+  --ps-lh-normal: 1.45;
+  --ps-lh-loose:  1.7;
+
+  /* ===== TRACKING ===== */
+  --ps-track-tight:  -0.02em;
+  --ps-track-normal: 0;
+  --ps-track-wide:   0.04em;
+  --ps-track-mono:   0.02em;
+  --ps-track-caps:   0.14em;  /* CODE_LABELS; */
+
+  /* ===== SPACING (4px base) ===== */
+  --ps-sp-0:  0;
+  --ps-sp-1:  2px;
+  --ps-sp-2:  4px;
+  --ps-sp-3:  8px;
+  --ps-sp-4:  12px;
+  --ps-sp-5:  16px;
+  --ps-sp-6:  24px;
+  --ps-sp-7:  32px;
+  --ps-sp-8:  48px;
+  --ps-sp-9:  64px;
+  --ps-sp-10: 96px;
+
+  /* ===== RADII — minimal, mostly square ===== */
+  --ps-radius-0: 0px;       /* default */
+  --ps-radius-1: 2px;       /* hairline soften */
+  --ps-radius-2: 4px;       /* chips */
+  --ps-radius-3: 8px;       /* cards */
+  --ps-radius-pill: 999px;  /* barcodes / capsules */
+
+  /* ===== ELEVATION — crisp, printed, NO blur clouds =====
+     PrintStream shadows are HARD and thin, like laser-etched. */
+  --ps-shadow-hair:  0 0 0 1px rgba(0,0,0,.08);
+  --ps-shadow-etch:  0 1px 0 0 rgba(0,0,0,.08), 0 0 0 1px rgba(0,0,0,.05);
+  --ps-shadow-card:  0 2px 0 0 rgba(0,0,0,.04), 0 0 0 1px rgba(0,0,0,.08);
+  --ps-shadow-float: 0 8px 24px -12px rgba(0,0,0,.25), 0 0 0 1px rgba(0,0,0,.06);
+  --ps-shadow-deep:  0 24px 48px -24px rgba(0,0,0,.45), 0 0 0 1px rgba(0,0,0,.08);
+
+  /* ===== MOTION ===== */
+  --ps-ease-print:   cubic-bezier(.2, .7, .2, 1);     /* crisp, like a print head */
+  --ps-ease-step:    steps(6, end);                    /* terminal-like */
+  --ps-dur-fast:    120ms;
+  --ps-dur-base:    220ms;
+  --ps-dur-slow:    420ms;
+}
+
+/* =============================================================
+   SEMANTIC TYPE — drop-in classes.
+   ============================================================= */
+.ps-display-xl,
+.ps-h0 {
+  font-family: var(--ps-font-display);
+  font-weight: var(--ps-weight-bold);
+  font-size: var(--ps-size-5xl);
+  line-height: var(--ps-lh-tight);
+  letter-spacing: var(--ps-track-tight);
+  color: var(--ps-fg-1);
+}
+
+.ps-h1 {
+  font-family: var(--ps-font-display);
+  font-weight: var(--ps-weight-bold);
+  font-size: var(--ps-size-4xl);
+  line-height: var(--ps-lh-tight);
+  letter-spacing: var(--ps-track-tight);
+  color: var(--ps-fg-1);
+}
+
+.ps-h2 {
+  font-family: var(--ps-font-display);
+  font-weight: var(--ps-weight-semibold);
+  font-size: var(--ps-size-3xl);
+  line-height: var(--ps-lh-snug);
+  letter-spacing: var(--ps-track-tight);
+  color: var(--ps-fg-1);
+}
+
+.ps-h3 {
+  font-family: var(--ps-font-display);
+  font-weight: var(--ps-weight-semibold);
+  font-size: var(--ps-size-2xl);
+  line-height: var(--ps-lh-snug);
+  color: var(--ps-fg-1);
+}
+
+.ps-h4 {
+  font-family: var(--ps-font-body);
+  font-weight: var(--ps-weight-semibold);
+  font-size: var(--ps-size-xl);
+  line-height: var(--ps-lh-snug);
+  color: var(--ps-fg-1);
+}
+
+.ps-lead {
+  font-family: var(--ps-font-body);
+  font-weight: var(--ps-weight-regular);
+  font-size: var(--ps-size-lg);
+  line-height: var(--ps-lh-normal);
+  color: var(--ps-fg-3);
+}
+
+.ps-p,
+.ps-body {
+  font-family: var(--ps-font-body);
+  font-weight: var(--ps-weight-regular);
+  font-size: var(--ps-size-base);
+  line-height: var(--ps-lh-normal);
+  color: var(--ps-fg-2);
+  text-wrap: pretty;
+}
+
+.ps-small {
+  font-family: var(--ps-font-body);
+  font-size: var(--ps-size-sm);
+  line-height: var(--ps-lh-normal);
+  color: var(--ps-fg-3);
+}
+
+.ps-meta {
+  font-family: var(--ps-font-mono);
+  font-size: var(--ps-size-xs);
+  letter-spacing: var(--ps-track-mono);
+  color: var(--ps-fg-4);
+}
+
+/* The signature "_code_label;" treatment */
+.ps-code-label {
+  font-family: var(--ps-font-mono);
+  font-weight: var(--ps-weight-medium);
+  font-size: var(--ps-size-xs);
+  letter-spacing: var(--ps-track-mono);
+  color: var(--ps-fg-2);
+  text-transform: lowercase;
+}
+.ps-code-label::before { content: "_"; opacity: .6; }
+.ps-code-label::after  { content: ";"; opacity: .6; }
+
+/* ALL-CAPS mono ticker label (B11;  B15;  B45;) */
+.ps-tag-code {
+  font-family: var(--ps-font-mono);
+  font-weight: var(--ps-weight-semibold);
+  font-size: var(--ps-size-xs);
+  letter-spacing: var(--ps-track-caps);
+  color: var(--ps-fg-1);
+  text-transform: uppercase;
+}
+
+/* Inline terminal / hex readout */
+.ps-mono,
+.ps-code {
+  font-family: var(--ps-font-mono);
+  font-size: var(--ps-size-sm);
+  letter-spacing: var(--ps-track-mono);
+  color: var(--ps-fg-2);
+}
+
+/* Section eyebrow */
+.ps-eyebrow {
+  font-family: var(--ps-font-mono);
+  font-weight: var(--ps-weight-medium);
+  font-size: var(--ps-size-2xs);
+  letter-spacing: var(--ps-track-caps);
+  text-transform: uppercase;
+  color: var(--ps-fg-4);
+}
+
+/* XXXY-style display glyph block */
+.ps-glyph-xxxy {
+  font-family: var(--ps-font-display);
+  font-weight: var(--ps-weight-bold);
+  font-size: var(--ps-size-5xl);
+  letter-spacing: -0.04em;
+  line-height: .9;
+  color: var(--ps-fg-1);
+}
+
+/* =============================================================
+   UTILITY — reticle/crosshair & barcode helpers (reused often)
+   ============================================================= */
+
+/* The pearlescent shimmer bar */
+.ps-shimmer-bar {
+  height: 4px;
+  background: var(--ps-pearl-gradient);
+  background-size: 200% 100%;
+  animation: ps-shimmer 6s linear infinite;
+}
+@keyframes ps-shimmer {
+  0%   { background-position:   0% 50%; }
+  100% { background-position: 200% 50%; }
+}
+
+/* Corner reticle brackets — wrap any element */
+.ps-reticle {
+  position: relative;
+}
+.ps-reticle::before,
+.ps-reticle::after {
+  content: "";
+  position: absolute;
+  width: 10px; height: 10px;
+  border: 1px solid currentColor;
+}
+.ps-reticle::before { top: -2px;    left: -2px;    border-right: 0; border-bottom: 0; }
+.ps-reticle::after  { bottom: -2px; right: -2px;   border-left: 0;  border-top: 0; }

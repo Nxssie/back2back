@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    back2back — Discord bot avatar (inverted, no dot).
+    Light iris-lilac circle (#D5C9F0) + dark ink-900 heart (#050507).
+    Heart is optically centred: nudged down 56px from the geometric box centre
+    so its top-heavy mass (wide lobes up top, thin point below) reads centred.
+    Square corners stay transparent (matches Discord's circular crop).
+  -->
+
+  <!-- light background circle (corners remain transparent) -->
+  <circle cx="512" cy="512" r="512" fill="#D5C9F0"/>
+
+  <!-- pixel heart -->
+  <g transform="translate(148,288) scale(56)" fill="#050507" shape-rendering="crispEdges">
+    <rect x="2"  y="0" width="3"  height="1"/>
+    <rect x="8"  y="0" width="3"  height="1"/>
+    <rect x="1"  y="1" width="5"  height="1"/>
+    <rect x="7"  y="1" width="5"  height="1"/>
+    <rect x="1"  y="2" width="11" height="1"/>
+    <rect x="0"  y="3" width="13" height="1"/>
+    <rect x="1"  y="4" width="11" height="1"/>
+    <rect x="2"  y="5" width="9"  height="1"/>
+    <rect x="3"  y="6" width="7"  height="1"/>
+    <rect x="4"  y="7" width="5"  height="1"/>
+    <rect x="5"  y="8" width="3"  height="1"/>
+    <rect x="6"  y="9" width="1"  height="1"/>
+  </g>
+</svg>
