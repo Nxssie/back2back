@@ -6,6 +6,7 @@ interface Song {
   videoId: string;
   url: string;
   title: string | null;
+  uploader: string | null;
   addedBy: string | null;
   addedByUserId: string | null;
   votes: number;

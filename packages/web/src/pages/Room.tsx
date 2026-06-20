@@ -810,7 +810,7 @@ export default function Room() {
                       canDelete={user?.id === group.song.addedByUserId}
                       onVote={vote}
                       onDelete={deleteSong}
-                      onPreview={setPreviewSong}
+                      onPreview={(song) => setPreviewSong(song)}
                     />
                   ) : (() => {
                     const isCollapsed = collapsedPlaylists.has(group.playlistId);
@@ -861,7 +861,7 @@ export default function Room() {
                                 canDelete={user?.id === song.addedByUserId}
                                 onVote={vote}
                                 onDelete={deleteSong}
-                                onPreview={setPreviewSong}
+                                onPreview={(song) => setPreviewSong(song)}
                               />
                             ))}
                           </div>
