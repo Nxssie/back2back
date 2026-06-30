@@ -23,10 +23,15 @@ export const songs = sqliteTable("songs", {
   roomId: text("room_id")
     .notNull()
     .references(() => rooms.id),
+  // Source-native track id: YouTube's 11-char id, or SoundCloud's numeric id.
   videoId: text("video_id").notNull(),
+  source: text("source").notNull().default("youtube"), // "youtube" | "soundcloud"
   url: text("url").notNull(),
   title: text("title"),
   uploader: text("uploader"),
+  // Artwork URL — only set for sources (SoundCloud) with no derivable thumbnail
+  // CDN pattern. YouTube thumbnails are derived client-side from videoId.
+  thumbnail: text("thumbnail"),
   addedBy: text("added_by"),
   addedByUserId: text("added_by_user_id"),
   votes: integer("votes").default(0),

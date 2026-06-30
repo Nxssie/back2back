@@ -8,7 +8,7 @@ export const commands = [
     .setName("play")
     .setDescription("Add a song to the queue and start playing")
     .addStringOption((option) =>
-      option.setName("url").setDescription("YouTube URL").setRequired(true)
+      option.setName("url").setDescription("YouTube or SoundCloud URL").setRequired(true)
     ),
   new SlashCommandBuilder()
     .setName("listen")

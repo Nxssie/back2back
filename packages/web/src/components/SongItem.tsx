@@ -4,9 +4,11 @@ import Glyph from "./Glyph";
 interface Song {
   id: number;
   videoId: string;
+  source: "youtube" | "soundcloud";
   url: string;
   title: string | null;
   uploader: string | null;
+  thumbnail: string | null;
   addedBy: string | null;
   addedByUserId: string | null;
   votes: number;
