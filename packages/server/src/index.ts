@@ -845,8 +845,14 @@ app.get("/api/rooms/:id/songs", async (c) => {
   const guildId = [...guildRoomMap.entries()].find(([, r]) => r === id)?.[0];
   const track = guildId ? currentTracks.get(guildId) : null;
   const currentSongStartedAt = track?.startedAt ?? null;
+  // The song actually streaming, not just the highest-voted unplayed one —
+  // those diverge once a pending song's votes overtake the one already
+  // playing (it stays played=false until it finishes). null when nothing is
+  // actively streaming (bot not connected yet), so the frontend can fall back
+  // to the vote-order heuristic in that case.
+  const currentSongId = track?.songId ?? null;
 
-  return c.json({ songs: roomSongs, userVotes, presentCount, currentSongStartedAt });
+  return c.json({ songs: roomSongs, userVotes, presentCount, currentSongStartedAt, currentSongId });
 });
 
 app.post("/api/rooms/:id/songs", async (c) => {
@@ -967,12 +973,23 @@ app.post("/api/rooms/:id/skip", async (c) => {
   const presentCount = [...userCurrentRoom.values()].filter((r) => r === id).length;
   const threshold = skipThreshold(presentCount);
 
-  const current = await db
-    .select()
-    .from(songs)
-    .where(and(eq(songs.roomId, id), eq(songs.played, false)))
-    .orderBy(desc(songs.votes), songs.createdAt)
-    .get();
+  const guildId = [...guildRoomMap.entries()].find(([, r]) => r === id)?.[0];
+  const track = guildId ? currentTracks.get(guildId) : null;
+
+  // Anchor to the song actually streaming (currentTracks), not the
+  // highest-voted unplayed one — those diverge once a pending song's votes
+  // overtake the one already playing (it stays played=false until it
+  // finishes), which would otherwise let a vote-skip mark the wrong song
+  // played while the real track keeps streaming. Fall back to the vote-order
+  // pick only when nothing is actively streaming (bot not connected).
+  const current = track
+    ? await db.select().from(songs).where(eq(songs.id, track.songId)).get()
+    : await db
+        .select()
+        .from(songs)
+        .where(and(eq(songs.roomId, id), eq(songs.played, false)))
+        .orderBy(desc(songs.votes), songs.createdAt)
+        .get();
 
   if (!current) return c.json({ error: "Nothing playing" }, 404);
   const isOwner = current.addedByUserId === user.id;
@@ -982,12 +999,9 @@ app.post("/api/rooms/:id/skip", async (c) => {
   // frontend refetches. The Idle handler will try to mark it again — harmless.
   await db.update(songs).set({ played: true }).where(eq(songs.id, current.id)).run();
 
-  for (const [guildId, roomId] of guildRoomMap) {
-    if (roomId === id) {
-      recentSkip.add(guildId);
-      players.get(guildId)?.stop();
-      break;
-    }
+  if (guildId) {
+    recentSkip.add(guildId);
+    players.get(guildId)?.stop();
   }
 
   console.log(`⏭️ Song "${current.title}" skipped in room ${id} by ${user.username} (${current.votes}/${threshold} votes)`);

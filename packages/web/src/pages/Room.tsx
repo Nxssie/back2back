@@ -76,6 +76,11 @@ export default function Room() {
 
   // When the currently-playing track started (server clock), for lyric sync.
   const [currentSongStartedAt, setCurrentSongStartedAt] = useState<number | null>(null);
+  // The song actually streaming right now, per the server's currentTracks —
+  // not just the highest-voted unplayed one (those diverge once a pending
+  // song's votes overtake the one already playing). Null when nothing is
+  // actively streaming (bot not connected), so we fall back to vote order.
+  const [currentSongId, setCurrentSongId] = useState<number | null>(null);
 
   // Signatures of the last applied payload, so an unchanged 4s poll doesn't
   // rebuild a new array and re-render the whole queue.
@@ -101,6 +106,7 @@ export default function Room() {
       // Primitive setState with an unchanged value is a no-op re-render in React.
       setPresentCount(data.presentCount ?? 1);
       setCurrentSongStartedAt(data.currentSongStartedAt ?? null);
+      setCurrentSongId(data.currentSongId ?? null);
     } catch {
       setError("ERR_01: fetch_failed;");
     } finally {
@@ -142,9 +148,14 @@ export default function Room() {
     };
   }, [id, user]);
 
-  // The first unplayed song is "now playing". Memoized so it isn't recomputed on
-  // every unrelated re-render (lyrics live in their own component now).
-  const currentSong = useMemo(() => songs.find((s) => !s.played), [songs]);
+  // Anchor to the song the server says is actually streaming; only fall back
+  // to "first unplayed by vote order" when nothing is actively streaming (bot
+  // not connected yet). Memoized so it isn't recomputed on every unrelated
+  // re-render (lyrics live in their own component now).
+  const currentSong = useMemo(
+    () => (currentSongId != null ? songs.find((s) => s.id === currentSongId) : songs.find((s) => !s.played)),
+    [songs, currentSongId]
+  );
 
   const leaveRoom = () => navigate("/");
 
