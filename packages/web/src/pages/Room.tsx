@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import YouTube from "react-youtube";
 import Navbar from "../components/Navbar";
 import SongItem from "../components/SongItem";
 import Waveform from "../components/Waveform";
@@ -9,12 +8,16 @@ import ReticleCorners from "../components/ReticleCorners";
 import LyricsPanel from "../components/LyricsPanel";
 import { useAuth } from "../hooks/useAuth";
 
+type Source = "youtube" | "soundcloud";
+
 interface Song {
   id: number;
   videoId: string;
+  source: Source;
   url: string;
   title: string | null;
   uploader: string | null;
+  thumbnail: string | null;
   addedBy: string | null;
   addedByUserId: string | null;
   votes: number;
@@ -24,10 +27,13 @@ interface Song {
 }
 
 interface SearchResult {
+  source: Source;
   videoId: string;
   title: string;
   duration: number | null;
   uploader: string | null;
+  url: string;
+  thumbnail: string | null;
 }
 
 function fmtDuration(seconds: number | null): string {
@@ -35,6 +41,13 @@ function fmtDuration(seconds: number | null): string {
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+// YouTube thumbnails are derived from the videoId (no DB column needed);
+// SoundCloud has no predictable CDN pattern so its artwork is stored verbatim.
+function thumbUrl(s: { source: Source; videoId: string; thumbnail: string | null }, size = "hqdefault"): string | null {
+  if (s.thumbnail) return s.thumbnail;
+  return s.source === "youtube" ? `https://i.ytimg.com/vi/${s.videoId}/${size}.jpg` : null;
 }
 
 export default function Room() {
@@ -54,10 +67,12 @@ export default function Room() {
   const [connectStatus, setConnectStatus] = useState<"idle" | "loading" | "ok" | "err">("idle");
   const [inputMode, setInputMode] = useState<"url" | "search">("url");
   const [searchQuery, setSearchQuery] = useState("");
+  const [searchSource, setSearchSource] = useState<Source>("youtube");
   const [collapsedPlaylists, setCollapsedPlaylists] = useState<Set<string>>(new Set());
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [sending, setSending] = useState(false);
 
   // When the currently-playing track started (server clock), for lyric sync.
   const [currentSongStartedAt, setCurrentSongStartedAt] = useState<number | null>(null);
@@ -153,7 +168,8 @@ export default function Room() {
 
   const addSong = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newUrl.trim() || !id) return;
+    if (!newUrl.trim() || !id || sending) return;
+    setSending(true);
     try {
       const res = await fetch(`/api/rooms/${id}/songs`, {
         method: "POST",
@@ -172,6 +188,8 @@ export default function Room() {
     } catch {
       setError("ERR_02: add_failed;");
       setTimeout(() => setError(null), 3000);
+    } finally {
+      setSending(false);
     }
   };
 
@@ -220,7 +238,7 @@ export default function Room() {
     if (searchTimer.current) clearTimeout(searchTimer.current);
     searchTimer.current = setTimeout(async () => {
       try {
-        const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}`);
+        const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}&source=${searchSource}`);
         const data = await res.json();
         setSearchResults(data.results || []);
       } catch {
@@ -230,7 +248,7 @@ export default function Room() {
       }
     }, 500);
     return () => { if (searchTimer.current) clearTimeout(searchTimer.current); };
-  }, [searchQuery, inputMode]);
+  }, [searchQuery, inputMode, searchSource]);
 
   const addFromSearch = async (result: SearchResult) => {
     if (!id) return;
@@ -239,7 +257,7 @@ export default function Room() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
-        body: JSON.stringify({ url: `https://www.youtube.com/watch?v=${result.videoId}` }),
+        body: JSON.stringify({ url: result.url }),
       });
       if (res.ok) {
         setSearchQuery("");
@@ -471,35 +489,51 @@ export default function Room() {
                       </button>
                     </div>
                     <div
-                      className="relative aspect-video w-full border border-white/10 text-ps-iris-cyan/50"
+                      className="relative aspect-video w-full border border-white/10 text-ps-iris-cyan/50 overflow-hidden"
                       style={{ boxShadow: "var(--ps-shadow-float)" }}
                     >
-                      <div className="absolute inset-0 overflow-hidden">
-                        <YouTube
-                          videoId={previewSong.videoId}
-                          opts={{ width: "100%", height: "100%", playerVars: { autoplay: 0 } }}
-                          className="w-full h-full"
-                          iframeClassName="w-full h-full block"
-                        />
-                      </div>
+                      {thumbUrl(previewSong) ? (
+                        <img src={thumbUrl(previewSong)!} alt="" className="w-full h-full object-cover" />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center bg-ps-graphite-700">
+                          <Glyph name="diamond" className="w-8 h-8 text-ps-steel-400" />
+                        </div>
+                      )}
                       <ReticleCorners size={12} />
                     </div>
                     <p className="text-[10px] font-mono text-ps-steel-400 tracking-wide text-center">
                       {previewSong.title || previewSong.videoId}
                     </p>
+                    <a
+                      href={previewSong.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center justify-center gap-1.5 text-[9px] font-mono text-ps-steel-400 hover:text-ps-iris-cyan transition-colors"
+                    >
+                      <Glyph name="reticle" className="w-3 h-3" />
+                      {previewSong.source === "youtube" ? "_open_in_youtube;" : "_open_in_soundcloud;"}
+                    </a>
                   </div>
                 ) : (
                   <>
                     {/* Thumbnail with waveform overlay */}
                     <div className="relative aspect-video w-full overflow-hidden border-b border-white/10">
-                      <img
-                        src={`https://i.ytimg.com/vi/${currentSong.videoId}/hqdefault.jpg`}
-                        alt=""
-                        className="w-full h-full object-cover"
-                        onError={(e) => {
-                          e.currentTarget.src = `https://i.ytimg.com/vi/${currentSong.videoId}/mqdefault.jpg`;
-                        }}
-                      />
+                      {thumbUrl(currentSong, "hqdefault") ? (
+                        <img
+                          src={thumbUrl(currentSong, "hqdefault")!}
+                          alt=""
+                          className="w-full h-full object-cover"
+                          onError={(e) => {
+                            if (currentSong.source === "youtube") {
+                              e.currentTarget.src = `https://i.ytimg.com/vi/${currentSong.videoId}/mqdefault.jpg`;
+                            }
+                          }}
+                        />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center bg-ps-graphite-700">
+                          <Glyph name="diamond" className="w-10 h-10 text-ps-steel-400" />
+                        </div>
+                      )}
                       {/* gradient so ON_AIR badge and waveform are legible */}
                       <div className="absolute inset-0 bg-gradient-to-t from-ps-ink-900/90 via-ps-ink-900/10 to-transparent" />
                       <div className="absolute top-3 left-3 flex items-center gap-2">
@@ -597,13 +631,13 @@ export default function Room() {
                     type="text"
                     value={newUrl}
                     onChange={(e) => setNewUrl(e.target.value)}
-                    placeholder="_youtube_url;"
+                    placeholder="_youtube_or_soundcloud_url;"
                     className="flex-1 px-4 py-3 bg-ps-graphite-700 border border-white/10 text-ps-fg-inv-1 placeholder-ps-steel-400 font-mono text-sm tracking-wide focus:outline-none focus:border-ps-iris-rose/40 transition-all duration-120"
                     style={{ transitionTimingFunction: "var(--ps-ease-print)" }}
                   />
                   <button
                     type="submit"
-                    disabled={!newUrl.trim()}
+                    disabled={!newUrl.trim() || sending}
                     className="group relative px-6 py-3 bg-ps-white text-ps-ink-900 disabled:opacity-30 disabled:cursor-not-allowed font-mono text-xs font-bold tracking-[0.14em] uppercase transition-all duration-120 hover:bg-ps-pearl-100 shrink-0"
                     style={{ boxShadow: "var(--ps-shadow-card)", transitionTimingFunction: "var(--ps-ease-print)" }}
                   >
@@ -612,19 +646,37 @@ export default function Room() {
                   </button>
                 </form>
               ) : (
-                <div className="relative flex gap-2 items-center">
-                  <input
-                    type="text"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="_search_youtube;"
-                    autoFocus
-                    className="flex-1 px-4 py-3 bg-ps-graphite-700 border border-white/10 text-ps-fg-inv-1 placeholder-ps-steel-400 font-mono text-sm tracking-wide focus:outline-none focus:border-ps-iris-cyan/40 transition-all duration-120"
-                    style={{ transitionTimingFunction: "var(--ps-ease-print)" }}
-                  />
-                  {searching && (
-                    <div className="absolute right-4 w-3 h-3 border border-ps-iris-cyan/40 border-t-ps-iris-cyan rounded-full animate-spin" />
-                  )}
+                <div className="space-y-2">
+                  <div className="flex border border-white/10 w-fit">
+                    {(["youtube", "soundcloud"] as const).map((s) => (
+                      <button
+                        key={s}
+                        type="button"
+                        onClick={() => setSearchSource(s)}
+                        className={`px-3 py-1.5 text-[9px] font-mono font-bold tracking-[0.12em] uppercase transition-colors duration-120 border-r border-white/10 last:border-r-0 ${
+                          searchSource === s
+                            ? "text-ps-fg-inv-1 bg-ps-graphite-700"
+                            : "text-ps-steel-400 hover:text-ps-fg-inv-2 bg-transparent"
+                        }`}
+                      >
+                        {s === "youtube" ? "YT" : "SC"}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="relative flex gap-2 items-center">
+                    <input
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder={searchSource === "youtube" ? "_search_youtube;" : "_search_soundcloud;"}
+                      autoFocus
+                      className="flex-1 px-4 py-3 bg-ps-graphite-700 border border-white/10 text-ps-fg-inv-1 placeholder-ps-steel-400 font-mono text-sm tracking-wide focus:outline-none focus:border-ps-iris-cyan/40 transition-all duration-120"
+                      style={{ transitionTimingFunction: "var(--ps-ease-print)" }}
+                    />
+                    {searching && (
+                      <div className="absolute right-4 w-3 h-3 border border-ps-iris-cyan/40 border-t-ps-iris-cyan rounded-full animate-spin" />
+                    )}
+                  </div>
                 </div>
               )}
             </div>
@@ -654,11 +706,17 @@ export default function Room() {
                       className="group flex items-center gap-3 p-3 bg-ps-graphite-700 hover:bg-ps-graphite-600 border border-white/10 transition-all duration-120"
                       style={{ transitionTimingFunction: "var(--ps-ease-print)" }}
                     >
-                      <img
-                        src={`https://i.ytimg.com/vi/${result.videoId}/default.jpg`}
-                        alt=""
-                        className="w-14 h-[39px] object-cover shrink-0 border border-white/10"
-                      />
+                      {result.thumbnail ? (
+                        <img
+                          src={result.thumbnail}
+                          alt=""
+                          className="w-14 h-[39px] object-cover shrink-0 border border-white/10"
+                        />
+                      ) : (
+                        <div className="w-14 h-[39px] flex items-center justify-center shrink-0 border border-white/10 bg-ps-ink-800 text-ps-steel-400">
+                          <Glyph name="diamond" className="w-3 h-3" />
+                        </div>
+                      )}
                       <div className="flex-1 min-w-0">
                         <p className="text-sm font-medium text-ps-fg-inv-1 truncate leading-snug">{result.title}</p>
                         <p className="text-[10px] font-mono text-ps-steel-400 mt-0.5 tracking-wide">

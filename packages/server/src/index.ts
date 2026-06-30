@@ -30,6 +30,7 @@ import { users, rooms, songs, votes, type User } from "./db/schema";
 import { eq, desc, and, inArray, lt, sql } from "drizzle-orm";
 import { commands } from "./commands";
 import { extractVideoId, isPlaylistUrl } from "./lib/youtube";
+import { detectSource, isSoundcloudSetUrl, type Source } from "./lib/sources";
 import { encodeJwt, decodeJwt } from "./lib/jwt";
 import { skipThreshold } from "./lib/voting";
 
@@ -203,12 +204,10 @@ function clientKey(c: any): string {
 // --- yt-dlp + ffmpeg audio stream ---
 // Returns the audio resource plus a cleanup() that kills both child processes,
 // so a finished/skipped/stopped track never leaves yt-dlp or ffmpeg lingering.
-function createAudioStream(videoId: string): {
+function createAudioStream(url: string): {
   resource: AudioResource;
   cleanup: () => void;
 } {
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
-
   const ytdlp = spawn(
     "yt-dlp",
     ["-f", "bestaudio", "--no-playlist", ...YTDLP_BASE_ARGS, ...YTDLP_DOWNLOAD_ARGS, "-o", "-", url],
@@ -238,8 +237,8 @@ function createAudioStream(videoId: string): {
 
   ytdlp.stdout.pipe(ffmpeg.stdin);
 
-  ytdlp.on("error", (e) => console.error(`❌ yt-dlp error for ${videoId}:`, e));
-  ffmpeg.on("error", (e) => console.error(`❌ ffmpeg error for ${videoId}:`, e));
+  ytdlp.on("error", (e) => console.error(`❌ yt-dlp error for ${url}:`, e));
+  ffmpeg.on("error", (e) => console.error(`❌ ffmpeg error for ${url}:`, e));
 
   // If ffmpeg exits (for any reason), yt-dlp is no longer useful.
   ffmpeg.on("close", () => {
@@ -253,7 +252,7 @@ function createAudioStream(videoId: string): {
   ytdlp.on("close", (code) => {
     if (code !== 0) {
       const tail = ytdlpErr.trim().split("\n").slice(-3).join(" | ");
-      console.error(`❌ yt-dlp exited ${code} for ${videoId}: ${tail || "(no stderr)"}`);
+      console.error(`❌ yt-dlp exited ${code} for ${url}: ${tail || "(no stderr)"}`);
       if (!ffmpeg.killed) {
         try { ffmpeg.kill("SIGKILL"); } catch {}
       }
@@ -271,11 +270,10 @@ function createAudioStream(videoId: string): {
   };
 }
 
-function getVideoInfo(videoId: string): Promise<{ title: string; uploader: string | null }> {
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
-  // spawn (not exec) passes the URL as a literal argv entry, never through a
-  // shell — this closes the command-injection sink that string interpolation
-  // into `yt-dlp --get-title "..."` opened.
+// spawn (not exec) passes the URL as a literal argv entry, never through a
+// shell — this closes the command-injection sink that string interpolation
+// into `yt-dlp --get-title "..."` opened.
+function getVideoInfo(url: string): Promise<{ title: string; uploader: string | null }> {
   return new Promise((resolve) => {
     const proc = spawn("yt-dlp", ["--get-title", "--no-warnings", ...YTDLP_BASE_ARGS, url], {
       stdio: ["ignore", "pipe", "ignore"],
@@ -283,9 +281,71 @@ function getVideoInfo(videoId: string): Promise<{ title: string; uploader: strin
     });
     let out = "";
     proc.stdout.on("data", (chunk) => (out += chunk));
-    proc.on("close", () => resolve({ title: out.trim() || videoId, uploader: null }));
-    proc.on("error", () => resolve({ title: videoId, uploader: null }));
+    proc.on("close", () => resolve({ title: out.trim() || url, uploader: null }));
+    proc.on("error", () => resolve({ title: url, uploader: null }));
   });
+}
+
+// Single yt-dlp round trip for a SoundCloud track: id, title, uploader,
+// canonical webpage url, and the highest-res artwork available (SoundCloud has
+// no predictable CDN pattern like YouTube's i.ytimg.com, so the URL must be
+// captured here). Returns null on timeout/failure so callers can 400 instead of
+// inserting a song with no usable metadata.
+function resolveSoundcloudTrack(url: string): Promise<{
+  videoId: string;
+  url: string;
+  title: string;
+  uploader: string | null;
+  thumbnail: string | null;
+} | null> {
+  return new Promise((resolve) => {
+    const proc = spawn(
+      "yt-dlp",
+      ["--dump-json", "--no-playlist", "--no-warnings", ...YTDLP_BASE_ARGS, url],
+      { stdio: ["ignore", "pipe", "ignore"], timeout: 15000 }
+    );
+    let output = "";
+    proc.stdout.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+    proc.on("close", () => {
+      try {
+        const d = JSON.parse(output.trim());
+        if (!d.id || !d.title) return resolve(null);
+        const thumbnail = d.thumbnail ?? d.thumbnails?.at(-1)?.url ?? null;
+        resolve({
+          videoId: String(d.id),
+          url: d.webpage_url || url,
+          title: String(d.title),
+          uploader: d.uploader ?? null,
+          thumbnail,
+        });
+      } catch {
+        resolve(null);
+      }
+    });
+    proc.on("error", () => resolve(null));
+  });
+}
+
+// Shared by the HTTP add-song endpoint and the Discord /play command so the
+// two surfaces can't drift on how a single track is resolved.
+async function resolveSingleTrack(
+  url: string,
+  source: Source
+): Promise<{
+  videoId: string;
+  url: string;
+  title: string | null;
+  uploader: string | null;
+  thumbnail: string | null;
+} | null> {
+  if (source === "youtube") {
+    const videoId = extractVideoId(url);
+    if (!videoId) return null;
+    const canonicalUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const { title, uploader } = await getVideoInfo(canonicalUrl);
+    return { videoId, url: canonicalUrl, title, uploader, thumbnail: null };
+  }
+  return resolveSoundcloudTrack(url);
 }
 
 // Fully release a guild's playback: kill child processes, stop the player,
@@ -436,14 +496,29 @@ async function playNextFromRoomInner(roomId: string, guildId: string) {
     return;
   }
 
-  // Get title if not cached
+  // Get title if not cached. SoundCloud playlist/set entries also carry no
+  // title from flat-playlist resolution, and their stored url may still be the
+  // internal api-v2 url yt-dlp's flat-playlist gave us — resolving here also
+  // self-heals it to the public webpage_url.
   if (!nextSong.title) {
-    const { title, uploader } = await getVideoInfo(nextSong.videoId);
-    db.update(songs)
-      .set({ title, uploader })
-      .where(eq(songs.id, nextSong.id))
-      .run();
-    nextSong.title = title;
+    if (nextSong.source === "soundcloud") {
+      const info = await resolveSoundcloudTrack(nextSong.url);
+      if (info) {
+        db.update(songs)
+          .set({ title: info.title, uploader: info.uploader, thumbnail: info.thumbnail, url: info.url })
+          .where(eq(songs.id, nextSong.id))
+          .run();
+        nextSong.title = info.title;
+        nextSong.url = info.url;
+      }
+    } else {
+      const { title, uploader } = await getVideoInfo(nextSong.url);
+      db.update(songs)
+        .set({ title, uploader })
+        .where(eq(songs.id, nextSong.id))
+        .run();
+      nextSong.title = title;
+    }
   }
 
   const connection = connections.get(guildId);
@@ -457,7 +532,7 @@ async function playNextFromRoomInner(roomId: string, guildId: string) {
 
   console.log(`▶️ Playing in room ${roomId}: ${nextSong.title || nextSong.videoId}`);
 
-  const { resource, cleanup } = createAudioStream(nextSong.videoId);
+  const { resource, cleanup } = createAudioStream(nextSong.url);
   const player = setupPlayer(guildId);
 
   player.play(resource);
@@ -518,9 +593,15 @@ app.get("/ready", async (c) => {
   }
 });
 
+// `source` picks how each flat-playlist entry's url is built: YouTube entries
+// reliably carry only an id, so the canonical watch url is reconstructed;
+// SoundCloud flat-playlist entries carry their own (sometimes internal API,
+// not the public webpage) url and never a title — titles for those are filled
+// in lazily by playNextFromRoomInner, same as any song missing a title.
 async function resolvePlaylist(
-  url: string
-): Promise<{ title: string; entries: Array<{ videoId: string; title: string }> } | null> {
+  url: string,
+  source: Source
+): Promise<{ title: string; entries: Array<{ videoId: string; title: string | null; url: string }> } | null> {
   return new Promise((resolve) => {
     const proc = spawn(
       "yt-dlp",
@@ -533,8 +614,15 @@ async function resolvePlaylist(
       try {
         const data = JSON.parse(output.trim());
         const entries = (data.entries || [])
-          .filter((e: any) => e.id && e.title)
-          .map((e: any) => ({ videoId: String(e.id), title: String(e.title) }));
+          .filter((e: any) => e.id)
+          .map((e: any) => ({
+            videoId: String(e.id),
+            title: e.title ? String(e.title) : null,
+            url: source === "youtube"
+              ? `https://www.youtube.com/watch?v=${e.id}`
+              : String(e.webpage_url || e.url || ""),
+          }))
+          .filter((e: { url: string }) => e.url);
         resolve({ title: data.title || "Playlist", entries });
       } catch {
         resolve(null);
@@ -771,10 +859,13 @@ app.post("/api/rooms/:id/songs", async (c) => {
   const body = await c.req.json();
   const { url } = body;
 
+  const source = detectSource(url);
+  if (!source) return c.json({ error: "Invalid YouTube or SoundCloud URL" }, 400);
+
   await ensureRoom(id, user.id);
 
-  if (isPlaylistUrl(url)) {
-    const playlist = await resolvePlaylist(url);
+  if (isPlaylistUrl(url) || isSoundcloudSetUrl(url)) {
+    const playlist = await resolvePlaylist(url, source);
     if (!playlist || playlist.entries.length === 0)
       return c.json({ error: "Could not resolve playlist" }, 400);
 
@@ -783,7 +874,8 @@ app.post("/api/rooms/:id/songs", async (c) => {
       playlist.entries.map((e) => ({
         roomId: id,
         videoId: e.videoId,
-        url: `https://www.youtube.com/watch?v=${e.videoId}`,
+        source,
+        url: e.url,
         title: e.title,
         addedBy: user.username,
         addedByUserId: user.id,
@@ -803,19 +895,19 @@ app.post("/api/rooms/:id/songs", async (c) => {
     return c.json({ playlistId, count: playlist.entries.length }, 201);
   }
 
-  const videoId = extractVideoId(url);
-  if (!videoId) return c.json({ error: "Invalid YouTube URL" }, 400);
-
-  const { title, uploader } = await getVideoInfo(videoId);
+  const resolved = await resolveSingleTrack(url, source);
+  if (!resolved) return c.json({ error: "Could not resolve track" }, 400);
 
   const song = await db
     .insert(songs)
     .values({
       roomId: id,
-      videoId,
-      url: `https://www.youtube.com/watch?v=${videoId}`,
-      title,
-      uploader,
+      videoId: resolved.videoId,
+      source,
+      url: resolved.url,
+      title: resolved.title,
+      uploader: resolved.uploader,
+      thumbnail: resolved.thumbnail,
       addedBy: user.username,
       addedByUserId: user.id,
     })
@@ -1022,12 +1114,22 @@ app.get("/api/search", async (c) => {
   if (!q) return c.json({ results: [] });
 
   const n = Math.min(Number(c.req.query("n") || 5), 10);
+  const source: Source = c.req.query("source") === "soundcloud" ? "soundcloud" : "youtube";
+  const searchPrefix = source === "youtube" ? "ytsearch" : "scsearch";
 
-  type SearchResult = { videoId: string; title: string; duration: number | null; uploader: string | null };
+  type SearchResult = {
+    source: Source;
+    videoId: string;
+    title: string;
+    duration: number | null;
+    uploader: string | null;
+    url: string;
+    thumbnail: string | null;
+  };
   const results = await new Promise<SearchResult[]>((resolve) => {
     const proc = spawn(
       "yt-dlp",
-      [`ytsearch${n}:${q}`, "--dump-json", "--flat-playlist", "--no-warnings", ...YTDLP_BASE_ARGS],
+      [`${searchPrefix}${n}:${q}`, "--dump-json", "--flat-playlist", "--no-warnings", ...YTDLP_BASE_ARGS],
       { stdio: ["ignore", "pipe", "ignore"] }
     );
 
@@ -1062,7 +1164,15 @@ app.get("/api/search", async (c) => {
           try {
             const e = JSON.parse(line);
             if (!e.id || !e.title) return [];
-            return [{ videoId: e.id, title: e.title, duration: e.duration ?? null, uploader: e.uploader ?? null }];
+            const videoId = String(e.id);
+            const url = source === "youtube"
+              ? `https://www.youtube.com/watch?v=${videoId}`
+              : String(e.webpage_url || e.url || "");
+            if (!url) return [];
+            const thumbnail = source === "youtube"
+              ? `https://i.ytimg.com/vi/${videoId}/default.jpg`
+              : (e.thumbnail ?? e.thumbnails?.at(-1)?.url ?? null);
+            return [{ source, videoId, title: String(e.title), duration: e.duration ?? null, uploader: e.uploader ?? null, url, thumbnail }];
           } catch {
             return [];
           }
@@ -1215,7 +1325,12 @@ discord.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.commandName === "play") {
       const url = interaction.options.getString("url");
       if (!url || !guildId) {
-        await interaction.reply("Provide a YouTube URL and be in a server");
+        await interaction.reply("Provide a YouTube or SoundCloud URL and be in a server");
+        return;
+      }
+      const source = detectSource(url);
+      if (!source) {
+        await interaction.reply("Invalid YouTube or SoundCloud URL");
         return;
       }
 
@@ -1234,20 +1349,21 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 
       await ensureRoom(roomId, interaction.user.id);
 
-      const videoId = extractVideoId(url);
-      if (!videoId) {
-        await interaction.editReply("Invalid YouTube URL");
+      const resolved = await resolveSingleTrack(url, source);
+      if (!resolved) {
+        await interaction.editReply("Could not resolve track");
         return;
       }
-
-      const { title, uploader } = await getVideoInfo(videoId);
+      const { title, uploader, thumbnail } = resolved;
 
       await db.insert(songs).values({
         roomId,
-        videoId,
-        url: `https://www.youtube.com/watch?v=${videoId}`,
+        videoId: resolved.videoId,
+        source,
+        url: resolved.url,
         title,
         uploader,
+        thumbnail,
         addedBy: interaction.user.username,
         addedByUserId: interaction.user.id,
       });
