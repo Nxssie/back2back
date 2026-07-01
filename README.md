@@ -1,14 +1,28 @@
 # Back2Back 🎵
 
-Synchronized music playback with your friends. Replaces the Discord workflow of passing links to bots.
+Synchronized music playback with your friends. Replaces the Discord workflow of
+passing links to bots — a shared room with a vote-ordered queue, in-app search,
+and a Discord bot that joins voice chat to play it back.
+
+## Features
+
+- **Vote-ordered queue** — the highest-voted unplayed track plays next; ties break by recency.
+- **YouTube & SoundCloud** — single tracks, YouTube playlists, and SoundCloud sets.
+- **In-app search** — find tracks on YouTube or SoundCloud without leaving the room.
+- **Discord OAuth** — JWT sessions in an http-only cookie, revocable on logout via token versioning.
+- **Discord bot** — slash commands to play and control playback from a voice channel.
+- **Vote-to-skip** — presence-based threshold; the song's owner skips free.
+- **Ownership & moderation** — creators delete their own rooms/songs; admins delete any.
+- **Admin panel** — live room list with song, pending, and presence counts, plus `/metrics`.
+- **Hardened by default** — rate limiting, input validation, hourly GC of stale rooms and old played songs, graceful shutdown.
 
 ## Tech Stack
 
 - **Runtime**: Bun
-- **Backend**: Hono + WebSockets
-- **Frontend**: React + Vite
-- **DB**: SQLite + Drizzle ORM
-- **Audio**: yt-dlp + @discordjs/voice
+- **Backend**: Hono (HTTP API + Discord gateway client)
+- **Frontend**: React 19 + Vite 6, Tailwind CSS 4, React Router 7
+- **Database**: SQLite (libSQL) + Drizzle ORM
+- **Audio**: yt-dlp + ffmpeg + @discordjs/voice
 - **Bot**: Discord.js
 
 ## Architecture
@@ -30,9 +44,9 @@ Synchronized music playback with your friends. Replaces the Discord workflow of 
 
 ### Requirements
 - Bun
-- yt-dlp (for local audio playback)
+- yt-dlp on `$PATH` (audio extraction)
+- A Discord application: bot token + OAuth2 client id/secret + redirect URI
 - Docker (optional, for Compose-based deploy)
-- Discord Bot Token
 
 ### Setup
 
@@ -59,20 +73,27 @@ docker compose up
 ```
 
 **Option 2: Local development**
+
+Install yt-dlp once:
 ```bash
-# Install yt-dlp
 pip install yt-dlp
-
-# Terminal 1: Server
-cd packages/server && bun dev
-
-# Terminal 2: Frontend
-cd packages/web && bun dev
 ```
 
-Or use the convenience script:
+From the repo root, one command starts both packages:
+```bash
+bun dev
+```
+
+Or use the convenience script, which loads `.env` into the server and gives each
+process its own process group for clean Ctrl+C shutdown:
 ```bash
 ./dev.sh
+```
+
+To run them individually:
+```bash
+bun dev:server   # http://localhost:3001
+bun dev:web      # http://localhost:5173
 ```
 
 ### URLs
@@ -81,19 +102,54 @@ Or use the convenience script:
 
 ## API
 
+All `/api/*` routes except `GET /api/rooms/:id` and `GET /api/rooms/:id/songs`
+require a valid `b2b_token` session cookie. Mutating routes return `401` when
+unauthenticated and `429` when rate-limited.
+
+### Auth
+- `GET /auth/discord` — Start the Discord OAuth flow
+- `GET /auth/discord/callback` — OAuth callback; sets the session cookie and redirects to `FRONTEND_URL`
+- `GET /auth/logout` — Revoke the session (bumps token version) and clear the cookie
+- `GET /api/auth/me` — Current user (`{ user }` or `{ user: null }`)
+
 ### Rooms
-- `GET /api/rooms/:id` — Get room
-- `GET /api/rooms/:id/songs` — List songs
-- `POST /api/rooms/:id/songs` — Add song `{ url, addedBy }`
-- `POST /api/rooms/:id/songs/:songId/vote` — Vote on a song
+- `GET /api/rooms/:id` — Room info, ownership, and `canDelete`
+- `POST /api/user/room` — Set/clear the caller's current room `{ roomId }` (drives presence + skip threshold)
+- `DELETE /api/rooms/:id` — Delete a room and cascade its songs/votes (owner or admin)
+
+### Songs
+- `GET /api/rooms/:id/songs` — Queue, the caller's votes, presence count, and the currently-streaming song
+- `POST /api/rooms/:id/songs` — Add a track or playlist `{ url }` (YouTube or SoundCloud)
+- `DELETE /api/rooms/:id/songs/:songId` — Remove a song (adder or admin)
+- `POST /api/rooms/:id/songs/:songId/vote` — Cast a vote (one per user per song)
+- `POST /api/rooms/:id/skip` — Skip the streaming song (owner skips free; otherwise votes ≥ threshold)
+- `POST /api/rooms/:id/playlists/:playlistId/skip` — Skip the rest of a playlist (adder or admin)
+
+### Playback
+- `POST /api/rooms/:id/connect` — Summon the bot into the caller's current voice channel
+
+### Search
+- `GET /api/search?q=&n=&source=youtube|soundcloud` — yt-dlp search
+
+### Admin
+- `GET /metrics` — Operational metrics (admin only)
+- `GET /api/admin/rooms` — All rooms with song/presence counts (admin only)
+
+### Health
+- `GET /health` — Liveness
+- `GET /ready` — Readiness (DB + Discord gateway)
 
 ### Discord Bot
-- `/play <url>` — Add to queue and play
-- `/listen` — Join voice channel and start the queue
+
+Slash commands (the bot must be invited to the server). `/play` accepts a
+YouTube or SoundCloud URL:
+
+- `/play <url>` — Add a track to the queue and start playing
+- `/listen` — Join the caller's voice channel and start the queue
 - `/stop` — Stop playback and disconnect
 - `/skip` — Skip the current song
 - `/queue` — Show the current queue
-- `/reset` — Reset played songs
+- `/reset` — Mark all songs as playable again
 
 ## Deploy (Coolify + Cloudflare Tunnel)
 
@@ -162,5 +218,5 @@ curl -s https://b2b.nxssie.dev/api/auth/me   # {"user":null}
 
 ## TODO
 
-- [ ] WebSocket real-time sync (frontend)
+- [ ] Real-time sync over WebSockets (frontend currently polls `/songs`)
 - [ ] UI polish
