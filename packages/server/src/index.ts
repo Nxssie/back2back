@@ -11,6 +11,7 @@ import {
   Events,
   REST,
   Routes,
+  PermissionsBitField,
   type VoiceBasedChannel,
 } from "discord.js";
 import {
@@ -591,6 +592,26 @@ app.get("/ready", async (c) => {
   } catch {
     return c.json({ ok: false }, 503);
   }
+});
+
+// Bot invite: redirect to Discord's OAuth2 bot authorization page with the
+// minimum permissions the bot needs — view channels + send messages for slash
+// commands, connect/speak/use-VAD for voice playback. Exposed as a redirect so
+// the frontend links here instead of duplicating the client id and permission
+// bitfield.
+app.get("/api/bot/invite", (c) => {
+  const permissions = new PermissionsBitField([
+    PermissionsBitField.Flags.ViewChannel,
+    PermissionsBitField.Flags.SendMessages,
+    PermissionsBitField.Flags.Connect,
+    PermissionsBitField.Flags.Speak,
+    PermissionsBitField.Flags.UseVAD,
+  ]);
+  const url = new URL("https://discord.com/api/oauth2/authorize");
+  url.searchParams.set("client_id", DISCORD_CLIENT_ID!);
+  url.searchParams.set("permissions", String(permissions.bitfield));
+  url.searchParams.set("scope", "bot applications.commands");
+  return c.redirect(url.toString());
 });
 
 // `source` picks how each flat-playlist entry's url is built: YouTube entries

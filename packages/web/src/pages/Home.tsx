@@ -97,7 +97,7 @@ export default function Home() {
           </div>
 
           {/* Status */}
-          <div className="text-center pt-4">
+          <div className="text-center pt-4 space-y-3">
             <p className="text-[11px] font-mono text-ps-steel-400 tracking-wide">
               {loading ? (
                 <span className="inline-block w-20 h-3 bg-ps-graphite-600 animate-pulse" />
@@ -112,6 +112,15 @@ export default function Home() {
                 </button>
               )}
             </p>
+            <a
+              href="/api/bot/invite"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 text-[10px] font-mono text-ps-steel-400 hover:text-ps-iris-cyan tracking-wide transition-colors duration-120"
+            >
+              <Glyph name="plus" className="w-3 h-3" />
+              ///invite_bot;
+            </a>
           </div>
 
           {/* Footer barcode */}
