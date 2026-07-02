@@ -57,6 +57,13 @@
       "when": 1782853391768,
       "tag": "0007_thankful_kitty_pryde",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1782983251589,
+      "tag": "0008_steep_sharon_carter",
+      "breakpoints": true
     }
   ]
 }
