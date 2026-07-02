@@ -15,6 +15,16 @@ interface AdminRoom {
   createdAt: number | null;
 }
 
+interface AdminGuild {
+  id: string;
+  name: string | null;
+  approved: boolean;
+  requestedBy: string | null;
+  requestedByUsername: string | null;
+  requestedAt: number | null;
+  approvedAt: number | null;
+}
+
 function timeAgo(epochSeconds: number | null): string {
   if (!epochSeconds) return "—";
   const diff = Math.floor(Date.now() / 1000) - epochSeconds;
@@ -33,6 +43,8 @@ export default function Admin() {
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const inFlight = useRef(false);
+  const [guilds, setGuilds] = useState<AdminGuild[]>([]);
+  const [approvingId, setApprovingId] = useState<string | null>(null);
 
   const fetchRooms = async () => {
     if (inFlight.current) return; // avoid overlapping polls
@@ -56,11 +68,22 @@ export default function Admin() {
     }
   };
 
+  const fetchGuilds = async () => {
+    try {
+      const res = await fetch("/api/admin/guilds", { credentials: "include" });
+      if (res.ok) {
+        const data = await res.json();
+        setGuilds(data.guilds || []);
+      }
+    } catch {}
+  };
+
   // Initial load + live polling (presence / idle age go stale immediately).
   useEffect(() => {
     if (loading || !user?.isAdmin) return;
     fetchRooms();
-    const t = setInterval(fetchRooms, 12_000);
+    fetchGuilds();
+    const t = setInterval(() => { fetchRooms(); fetchGuilds(); }, 12_000);
     return () => clearInterval(t);
   }, [loading, user]);
 
@@ -85,6 +108,52 @@ export default function Admin() {
       setTimeout(() => setError(null), 3000);
     } finally {
       setDeletingId(null);
+    }
+  };
+
+  const approveGuild = async (guildId: string) => {
+    if (approvingId) return;
+    setApprovingId(guildId);
+    try {
+      const res = await fetch(`/api/admin/guilds/${guildId}/approve`, {
+        method: "POST",
+        credentials: "include",
+      });
+      if (res.ok) {
+        setGuilds((prev) => prev.map((g) => g.id === guildId ? { ...g, approved: true } : g));
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setError(data.error || "ERR: approve_failed;");
+        setTimeout(() => setError(null), 3000);
+      }
+    } catch {
+      setError("ERR: approve_failed;");
+      setTimeout(() => setError(null), 3000);
+    } finally {
+      setApprovingId(null);
+    }
+  };
+
+  const rejectGuild = async (guildId: string) => {
+    if (approvingId) return;
+    setApprovingId(guildId);
+    try {
+      const res = await fetch(`/api/admin/guilds/${guildId}/reject`, {
+        method: "POST",
+        credentials: "include",
+      });
+      if (res.ok) {
+        setGuilds((prev) => prev.filter((g) => g.id !== guildId));
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setError(data.error || "ERR: reject_failed;");
+        setTimeout(() => setError(null), 3000);
+      }
+    } catch {
+      setError("ERR: reject_failed;");
+      setTimeout(() => setError(null), 3000);
+    } finally {
+      setApprovingId(null);
     }
   };
 
@@ -138,11 +207,96 @@ export default function Admin() {
               ///admin;
             </span>
           </div>
+          <h1 className="font-display font-bold text-3xl lg:text-4xl tracking-tight text-ps-fg-inv-1">
+            DASHBOARD
+          </h1>
+          <div className="ps-shimmer-bar w-full mt-3 opacity-50" />
+        </div>
+
+        {/* Guild approvals */}
+        {(() => {
+          const pending = guilds.filter((g) => !g.approved);
+          const approvedList = guilds.filter((g) => g.approved);
+          if (pending.length === 0 && approvedList.length === 0) return null;
+          return (
+            <div className="mb-8 lg:mb-10">
+              <div className="flex items-end justify-between gap-4 mb-4">
+                <h2 className="font-display font-bold text-xl tracking-tight text-ps-fg-inv-1">
+                  GUILD_APPROVALS
+                </h2>
+                {pending.length > 0 && (
+                  <span className="text-[10px] font-mono text-ps-steel-400 tracking-wide">
+                    {pending.length} _pending;
+                  </span>
+                )}
+              </div>
+
+              {pending.length > 0 && (
+                <div className="border border-white/10">
+                  {pending.map((guild) => (
+                    <div
+                      key={guild.id}
+                      className="flex items-center gap-4 px-4 py-3 border-b border-white/10 last:border-b-0"
+                    >
+                      <div className="flex-1 min-w-0">
+                        <p className="font-mono text-xs text-ps-iris-cyan truncate">
+                          {guild.name || guild.id}
+                        </p>
+                        <p className="font-mono text-[10px] text-ps-steel-400 truncate">
+                          _by:{guild.requestedByUsername || guild.requestedBy || "—"}
+                        </p>
+                      </div>
+                      <span className="text-[10px] font-mono text-ps-steel-400 shrink-0">
+                        {timeAgo(guild.requestedAt)}
+                      </span>
+                      <button
+                        onClick={() => approveGuild(guild.id)}
+                        disabled={approvingId === guild.id}
+                        className="flex items-center gap-1.5 px-3 py-1.5 border border-ps-signal-ok/30 bg-ps-signal-ok/10 text-ps-signal-ok text-[9px] font-mono font-bold tracking-wide hover:bg-ps-signal-ok/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-120"
+                        style={{ transitionTimingFunction: "var(--ps-ease-print)" }}
+                      >
+                        <Glyph name="check" className="w-3 h-3" />
+                        APPROVE;
+                      </button>
+                      <button
+                        onClick={() => rejectGuild(guild.id)}
+                        disabled={approvingId === guild.id}
+                        className="flex items-center gap-1.5 px-3 py-1.5 border border-white/10 bg-ps-graphite-600 text-ps-steel-400 text-[9px] font-mono tracking-wide hover:text-ps-signal-danger hover:border-ps-signal-danger/30 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-120"
+                        style={{ transitionTimingFunction: "var(--ps-ease-print)" }}
+                      >
+                        REJECT;
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {approvedList.length > 0 && (
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {approvedList.map((guild) => (
+                    <div
+                      key={guild.id}
+                      className="flex items-center gap-2 px-3 py-1.5 bg-ps-graphite-700 border border-white/10"
+                    >
+                      <span className="w-1.5 h-1.5 bg-ps-signal-ok rounded-full" />
+                      <span className="text-[10px] font-mono text-ps-fg-inv-2">
+                        {guild.name || guild.id}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
+        {/* Room registry */}
+        <div className="mb-6">
           <div className="flex items-end justify-between gap-4">
-            <h1 className="font-display font-bold text-3xl lg:text-4xl tracking-tight text-ps-fg-inv-1">
+            <h2 className="font-display font-bold text-xl tracking-tight text-ps-fg-inv-1">
               ROOM_REGISTRY
-            </h1>
-            <span className="shrink-0 text-[10px] font-mono text-ps-steel-400 tracking-wide">
+            </h2>
+            <span className="text-[10px] font-mono text-ps-steel-400 tracking-wide">
               {rooms.length} _rooms;
             </span>
           </div>

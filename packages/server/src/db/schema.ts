@@ -68,7 +68,18 @@ export const votes = sqliteTable(
   ]
 );
 
+export const guilds = sqliteTable("guilds", {
+  id: text("id").primaryKey(), // Discord guild ID
+  name: text("name"),
+  approved: integer("approved", { mode: "boolean" }).notNull().default(false),
+  requestedBy: text("requested_by"),
+  requestedByUsername: text("requested_by_username"),
+  requestedAt: integer("requested_at"),
+  approvedAt: integer("approved_at"),
+});
+
 export type User = typeof users.$inferSelect;
 export type Room = typeof rooms.$inferSelect;
 export type Song = typeof songs.$inferSelect;
 export type Vote = typeof votes.$inferSelect;
+export type GuildRecord = typeof guilds.$inferSelect;

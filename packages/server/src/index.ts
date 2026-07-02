@@ -26,7 +26,7 @@ import {
   type VoiceConnection,
 } from "@discordjs/voice";
 import { db } from "./db";
-import { users, rooms, songs, votes, type User } from "./db/schema";
+import { users, rooms, songs, votes, guilds, type User } from "./db/schema";
 import { eq, desc, and, inArray, lt, sql } from "drizzle-orm";
 import { commands } from "./commands";
 import { extractVideoId, isPlaylistUrl } from "./lib/youtube";
@@ -1314,6 +1314,49 @@ app.get("/api/admin/rooms", async (c) => {
   return c.json({ rooms: list, count: list.length });
 });
 
+// List every guild with approval status. Admin-only.
+app.get("/api/admin/guilds", async (c) => {
+  const user = await getUser(c);
+  if (!user) return c.json({ error: "Login required" }, 401);
+  if (!isAdmin(user)) return c.json({ error: "Not authorized" }, 403);
+
+  const allGuilds = await db.select().from(guilds).orderBy(desc(guilds.requestedAt)).all();
+  return c.json({ guilds: allGuilds });
+});
+
+// Approve a pending guild — the bot becomes active there.
+app.post("/api/admin/guilds/:guildId/approve", async (c) => {
+  const { guildId } = c.req.param();
+  const user = await getUser(c);
+  if (!user) return c.json({ error: "Login required" }, 401);
+  if (!isAdmin(user)) return c.json({ error: "Not authorized" }, 403);
+
+  await db
+    .update(guilds)
+    .set({ approved: true, approvedAt: nowSeconds() })
+    .where(eq(guilds.id, guildId))
+    .run();
+  console.log(`✅ Guild ${guildId} approved by ${user.username}`);
+  return c.json({ success: true });
+});
+
+// Reject a guild — removes the record and leaves the Discord server.
+app.post("/api/admin/guilds/:guildId/reject", async (c) => {
+  const { guildId } = c.req.param();
+  const user = await getUser(c);
+  if (!user) return c.json({ error: "Login required" }, 401);
+  if (!isAdmin(user)) return c.json({ error: "Not authorized" }, 403);
+
+  await db.delete(guilds).where(eq(guilds.id, guildId)).run();
+  teardownGuild(guildId);
+  const guild = discord.guilds.cache.get(guildId);
+  if (guild) {
+    try { await guild.leave(); } catch (e) { console.error(`Failed to leave guild ${guildId}:`, e); }
+  }
+  console.log(`❌ Guild ${guildId} rejected by ${user.username}`);
+  return c.json({ success: true });
+});
+
 // ==================== DISCORD BOT ====================
 
 discord.once(Events.ClientReady, async (c) => {
@@ -1329,11 +1372,57 @@ discord.once(Events.ClientReady, async (c) => {
   } catch (err) {
     console.error("Failed to register slash commands:", err);
   }
+
+  // Register existing guilds. Legacy guilds (in cache but not yet in DB)
+  // are auto-approved so upgrading is painless — only newly-invited guilds
+  // start as pending.
+  for (const guild of c.guilds.cache.values()) {
+    const existing = await db.select().from(guilds).where(eq(guilds.id, guild.id)).get();
+    if (!existing) {
+      await db.insert(guilds).values({
+        id: guild.id,
+        name: guild.name,
+        approved: true,
+        approvedAt: nowSeconds(),
+      }).run();
+    }
+  }
+});
+
+// New guilds start as pending approval — the bot joins but stays dormant
+// (InteractionCreate gates on the guilds.approved flag).
+discord.on(Events.GuildCreate, async (guild) => {
+  const existing = await db.select().from(guilds).where(eq(guilds.id, guild.id)).get();
+  if (!existing) {
+    await db.insert(guilds).values({
+      id: guild.id,
+      name: guild.name,
+      approved: false,
+      requestedAt: nowSeconds(),
+    }).run();
+    console.log(`📋 Guild "${guild.name}" (${guild.id}) pending approval`);
+  }
+});
+
+// Clean up when the bot is kicked from a guild.
+discord.on(Events.GuildDelete, async (guild) => {
+  await db.delete(guilds).where(eq(guilds.id, guild.id)).run();
+  teardownGuild(guild.id);
+  console.log(`🗑️ Guild "${guild.name}" (${guild.id}) removed`);
 });
 
 discord.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   const { guildId } = interaction;
+
+  // Gate on guild approval: pending or unknown guilds can't use bot commands.
+  if (guildId) {
+    const guildRecord = await db.select().from(guilds).where(eq(guilds.id, guildId)).get();
+    if (!guildRecord || !guildRecord.approved) {
+      await interaction.reply({ content: "⏳ This server is pending admin approval.", ephemeral: true });
+      return;
+    }
+  }
 
   try {
     if (interaction.commandName === "play") {
