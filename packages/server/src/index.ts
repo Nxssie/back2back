@@ -86,6 +86,13 @@ const ROOM_TTL_MS = Number(process.env.ROOM_TTL_HOURS || 24) * 60 * 60 * 1000;
 // votes don't grow without bound in long-lived rooms.
 const PLAYED_SONG_TTL_MS =
   Number(process.env.PLAYED_SONG_TTL_HOURS || 24) * 60 * 60 * 1000;
+// Leave a voice channel once the queue has been empty (and nothing playing) for
+// this long, so the bot isn't parked in a channel holding a voice slot for no
+// reason. Override with EMPTY_QUEUE_LEAVE_MINUTES.
+const EMPTY_QUEUE_LEAVE_MS =
+  Number(process.env.EMPTY_QUEUE_LEAVE_MINUTES || 5) * 60 * 1000;
+// Leave a voice channel once the bot has been the only one in it for this long.
+const ALONE_LEAVE_MS = 60 * 1000;
 
 function isAdmin(user: User | null): boolean {
   return !!user && ADMIN_DISCORD_IDS.has(user.id);
@@ -131,6 +138,10 @@ const recentSkip = new Set<string>();
 // up-to-15s getVideoInfo await — without this, two concurrent advances each
 // spawn yt-dlp+ffmpeg and the first pair is orphaned/leaked).
 const advancing = new Set<string>();
+// Timestamps tracking when each guild's voice connection first became idle by
+// each metric, so we can leave after a grace period instead of immediately.
+const emptySince = new Map<string, number>();
+const aloneSince = new Map<string, number>();
 const FAST_FAIL_MS = 5_000;
 const MAX_CONSECUTIVE_FAILURES = 5;
 const failureBackoffMs = (n: number) => [3_000, 8_000, 15_000, 30_000][n - 1] ?? 30_000;
@@ -357,6 +368,8 @@ function teardownGuild(guildId: string) {
   if (pending) { clearTimeout(pending); pendingAdvance.delete(guildId); }
   consecutiveFailures.delete(guildId);
   recentSkip.delete(guildId);
+  emptySince.delete(guildId);
+  aloneSince.delete(guildId);
   // Drop the room mapping BEFORE stopping the player: stop() fires Idle, and the
   // Idle handler must not find a room to advance into while we're tearing down.
   guildRoomMap.delete(guildId);
@@ -1645,6 +1658,74 @@ async function runMaintenance() {
 
 setInterval(runMaintenance, 60 * 60 * 1000); // hourly
 setTimeout(() => void runMaintenance(), 30_000); // once, shortly after boot
+
+// --- Voice-channel reaping ---
+// If the queue has been empty (and nothing playing) for EMPTY_QUEUE_LEAVE_MS,
+// or the bot has been alone in the voice channel for ALONE_LEAVE_MS, leave so
+// the bot isn't parked in a channel consuming a slot for no reason.
+function isAloneInVoice(guildId: string): boolean {
+  const conn = connections.get(guildId);
+  if (!conn) return false;
+  const channelId = conn.joinConfig.channelId;
+  if (!channelId) return false;
+  const guild = discord.guilds.cache.get(guildId);
+  if (!guild) return false;
+  const botId = discord.user?.id;
+  for (const vs of guild.voiceStates.cache.values()) {
+    if (vs.channelId === channelId && vs.id !== botId) return false;
+  }
+  return true;
+}
+
+async function hasUnplayedSongs(roomId: string): Promise<boolean> {
+  const row = await db
+    .select({ c: sql<number>`count(*)` })
+    .from(songs)
+    .where(and(eq(songs.roomId, roomId), eq(songs.played, false)))
+    .get();
+  return (row?.c ?? 0) > 0;
+}
+
+async function reapIdleVoiceConnections() {
+  const now = Date.now();
+  for (const guildId of [...connections.keys()]) {
+    const roomId = guildRoomMap.get(guildId);
+
+    // Alone in the voice channel — leave quickly.
+    if (isAloneInVoice(guildId)) {
+      if (!aloneSince.has(guildId)) aloneSince.set(guildId, now);
+      if (now - aloneSince.get(guildId)! >= ALONE_LEAVE_MS) {
+        console.log(
+          `👋 Bot alone in voice channel for ${ALONE_LEAVE_MS / 1000}s (guild ${guildId}); leaving.`
+        );
+        teardownGuild(guildId);
+        continue;
+      }
+    } else {
+      aloneSince.delete(guildId);
+    }
+
+    // Empty queue (and nothing currently playing) — leave after the grace period.
+    if (!currentTracks.has(guildId) && roomId) {
+      if (!(await hasUnplayedSongs(roomId))) {
+        if (!emptySince.has(guildId)) emptySince.set(guildId, now);
+        if (now - emptySince.get(guildId)! >= EMPTY_QUEUE_LEAVE_MS) {
+          console.log(
+            `📭 Queue empty for ${Math.round(EMPTY_QUEUE_LEAVE_MS / 60_000)}min (guild ${guildId}); leaving.`
+          );
+          teardownGuild(guildId);
+          continue;
+        }
+      } else {
+        emptySince.delete(guildId);
+      }
+    } else {
+      emptySince.delete(guildId);
+    }
+  }
+}
+
+setInterval(() => void reapIdleVoiceConnections(), 15_000);
 
 // --- Process-level safety nets ---
 // A single unhandled error in an event handler must not take down the whole
