@@ -240,6 +240,7 @@ function createAudioStream(url: string): {
     ffmpegStatic!,
     [
       "-i", "pipe:0",
+      "-vn",
       "-c:a", "libopus",
       "-ar", "48000",
       "-ac", "2",
