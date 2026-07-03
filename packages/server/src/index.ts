@@ -1405,8 +1405,16 @@ if (IS_PROD) {
       return c.json({ error: "Not found" }, 404);
     }
     const file = Bun.file(path.join(WEB_DIST_DIR, p));
-    if (await file.exists()) return new Response(file);
-    return new Response(Bun.file(INDEX_HTML));
+    if (await file.exists()) {
+      return new Response(file, {
+        headers: { "Content-Type": file.type || "application/octet-stream" },
+      });
+    }
+    // SPA fallback — serve index.html for client-side routes
+    const indexFile = Bun.file(INDEX_HTML);
+    return new Response(indexFile, {
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
   });
 }
 
