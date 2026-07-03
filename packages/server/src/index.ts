@@ -341,6 +341,44 @@ function resolveSoundcloudTrack(url: string): Promise<{
   });
 }
 
+// Single yt-dlp round trip for a Twitch VOD/clip: id, title, uploader, and
+// thumbnail. Twitch URLs don't carry a parseable ID like YouTube, so we rely
+// entirely on yt-dlp's --dump-json to extract metadata.
+function resolveTwitchTrack(url: string): Promise<{
+  videoId: string;
+  url: string;
+  title: string;
+  uploader: string | null;
+  thumbnail: string | null;
+} | null> {
+  return new Promise((resolve) => {
+    const proc = spawn(
+      "yt-dlp",
+      ["--dump-json", "--no-playlist", "--no-warnings", ...YTDLP_BASE_ARGS, url],
+      { stdio: ["ignore", "pipe", "ignore"], timeout: 15000 }
+    );
+    let output = "";
+    proc.stdout.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+    proc.on("close", () => {
+      try {
+        const d = JSON.parse(output.trim());
+        if (!d.id || !d.title) return resolve(null);
+        const thumbnail = d.thumbnail ?? d.thumbnails?.at(-1)?.url ?? null;
+        resolve({
+          videoId: String(d.id),
+          url: d.webpage_url || url,
+          title: String(d.title),
+          uploader: d.uploader ?? d.channel ?? null,
+          thumbnail,
+        });
+      } catch {
+        resolve(null);
+      }
+    });
+    proc.on("error", () => resolve(null));
+  });
+}
+
 // Shared by the HTTP add-song endpoint and the Discord /play command so the
 // two surfaces can't drift on how a single track is resolved.
 async function resolveSingleTrack(
@@ -359,6 +397,17 @@ async function resolveSingleTrack(
     const canonicalUrl = `https://www.youtube.com/watch?v=${videoId}`;
     const { title, uploader } = await getVideoInfo(canonicalUrl);
     return { videoId, url: canonicalUrl, title, uploader, thumbnail: null };
+  }
+  if (source === "twitch") return resolveTwitchTrack(url);
+  if (source === "generic") {
+    // Direct streaming manifest — yt-dlp handles HLS/DASH natively.
+    // No parseable video ID; use a truncated SHA-256 of the URL.
+    const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(url)))]
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("")
+      .slice(0, 16);
+    const { title, uploader } = await getVideoInfo(url);
+    return { videoId: hash, url, title, uploader, thumbnail: null };
   }
   return resolveSoundcloudTrack(url);
 }
@@ -513,10 +562,9 @@ async function playNextFromRoomInner(roomId: string, guildId: string) {
     return;
   }
 
-  // Get title if not cached. SoundCloud playlist/set entries also carry no
-  // title from flat-playlist resolution, and their stored url may still be the
-  // internal api-v2 url yt-dlp's flat-playlist gave us — resolving here also
-  // self-heals it to the public webpage_url.
+  // Get title if not cached. SoundCloud and Twitch entries carry no title
+  // from flat-playlist resolution, and their stored url may still be an
+  // internal url — resolving here also self-heals it to the public webpage_url.
   if (!nextSong.title) {
     if (nextSong.source === "soundcloud") {
       const info = await resolveSoundcloudTrack(nextSong.url);
@@ -528,7 +576,18 @@ async function playNextFromRoomInner(roomId: string, guildId: string) {
         nextSong.title = info.title;
         nextSong.url = info.url;
       }
+    } else if (nextSong.source === "twitch") {
+      const info = await resolveTwitchTrack(nextSong.url);
+      if (info) {
+        db.update(songs)
+          .set({ title: info.title, uploader: info.uploader, thumbnail: info.thumbnail, url: info.url })
+          .where(eq(songs.id, nextSong.id))
+          .run();
+        nextSong.title = info.title;
+        nextSong.url = info.url;
+      }
     } else {
+      // YouTube, generic HLS/DASH
       const { title, uploader } = await getVideoInfo(nextSong.url);
       db.update(songs)
         .set({ title, uploader })
@@ -903,7 +962,7 @@ app.post("/api/rooms/:id/songs", async (c) => {
   const { url } = body;
 
   const source = detectSource(url);
-  if (!source) return c.json({ error: "Invalid YouTube or SoundCloud URL" }, 400);
+  if (!source) return c.json({ error: "Invalid YouTube, SoundCloud, Twitch, or streaming URL (.m3u8/.mpd)" }, 400);
 
   await ensureRoom(id, user.id);
 
@@ -1165,8 +1224,9 @@ app.get("/api/search", async (c) => {
   if (!q) return c.json({ results: [] });
 
   const n = Math.min(Number(c.req.query("n") || 5), 10);
-  const source: Source = c.req.query("source") === "soundcloud" ? "soundcloud" : "youtube";
-  const searchPrefix = source === "youtube" ? "ytsearch" : "scsearch";
+  const rawSource = c.req.query("source");
+  const source: Source = rawSource === "soundcloud" ? "soundcloud" : rawSource === "twitch" ? "twitch" : "youtube";
+  const searchPrefix = source === "youtube" ? "ytsearch" : source === "twitch" ? "twitchsearch" : "scsearch";
 
   type SearchResult = {
     source: Source;
@@ -1481,12 +1541,12 @@ discord.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.commandName === "play") {
       const url = interaction.options.getString("url");
       if (!url || !guildId) {
-        await interaction.reply("Provide a YouTube or SoundCloud URL and be in a server");
+        await interaction.reply("Provide a YouTube, SoundCloud, Twitch, or streaming URL and be in a server");
         return;
       }
       const source = detectSource(url);
       if (!source) {
-        await interaction.reply("Invalid YouTube or SoundCloud URL");
+        await interaction.reply("Invalid YouTube, SoundCloud, Twitch, or streaming URL");
         return;
       }
 
