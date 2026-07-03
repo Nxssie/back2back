@@ -8,8 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # yt-dlp standalone binary — no Python runtime needed in the final image.
-RUN curl -L -o /usr/local/bin/yt-dlp \
-    https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux \
+# Pin to a specific release to avoid redirect/TLS issues with /latest/download.
+RUN curl --retry 3 --retry-delay 5 -L -o /usr/local/bin/yt-dlp \
+    https://github.com/yt-dlp/yt-dlp/releases/download/2026.06.09/yt-dlp_linux \
     && chmod +x /usr/local/bin/yt-dlp
 
 COPY package.json bun.lock* ./
