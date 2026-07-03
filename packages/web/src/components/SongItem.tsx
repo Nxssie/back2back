@@ -4,7 +4,7 @@ import Glyph from "./Glyph";
 interface Song {
   id: number;
   videoId: string;
-  source: "youtube" | "soundcloud" | "twitch" | "generic";
+  source: "youtube" | "soundcloud" | "mixcloud" | "twitch" | "generic";
   url: string;
   title: string | null;
   uploader: string | null;

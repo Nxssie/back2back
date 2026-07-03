@@ -7,7 +7,7 @@ and a Discord bot that joins voice chat to play it back.
 ## Features
 
 - **Vote-ordered queue** — the highest-voted unplayed track plays next; ties break by recency.
-- **YouTube & SoundCloud** — single tracks, YouTube playlists, and SoundCloud sets.
+- **YouTube & SoundCloud** — single tracks, YouTube playlists, SoundCloud sets, and Mixcloud mixes.
 - **In-app search** — find tracks on YouTube or SoundCloud without leaving the room.
 - **Discord OAuth** — JWT sessions in an http-only cookie, revocable on logout via token versioning.
 - **Discord bot** — slash commands to play and control playback from a voice channel.
@@ -119,7 +119,7 @@ unauthenticated and `429` when rate-limited.
 
 ### Songs
 - `GET /api/rooms/:id/songs` — Queue, the caller's votes, presence count, and the currently-streaming song
-- `POST /api/rooms/:id/songs` — Add a track or playlist `{ url }` (YouTube or SoundCloud)
+- `POST /api/rooms/:id/songs` — Add a track or playlist `{ url }` (YouTube, SoundCloud, Mixcloud, or Twitch)
 - `DELETE /api/rooms/:id/songs/:songId` — Remove a song (adder or admin)
 - `POST /api/rooms/:id/songs/:songId/vote` — Cast a vote (one per user per song)
 - `POST /api/rooms/:id/skip` — Skip the streaming song (owner skips free; otherwise votes ≥ threshold)
@@ -142,7 +142,7 @@ unauthenticated and `429` when rate-limited.
 ### Discord Bot
 
 Slash commands (the bot must be invited to the server). `/play` accepts a
-YouTube or SoundCloud URL:
+YouTube, SoundCloud, Mixcloud, or Twitch URL:
 
 - `/play <url>` — Add a track to the queue and start playing
 - `/listen` — Join the caller's voice channel and start the queue

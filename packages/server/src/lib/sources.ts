@@ -2,10 +2,11 @@
 // security gate that keeps yt-dlp from being pointed at an arbitrary host (SSRF);
 // shell injection is separately closed by spawn() passing argv, never a shell.
 
-export type Source = "youtube" | "soundcloud" | "twitch" | "generic";
+export type Source = "youtube" | "soundcloud" | "mixcloud" | "twitch" | "generic";
 
 const YOUTUBE_HOSTS = new Set(["youtube.com", "music.youtube.com", "youtu.be"]);
 const SOUNDCLOUD_HOSTS = new Set(["soundcloud.com", "m.soundcloud.com", "on.soundcloud.com"]);
+const MIXCLOUD_HOSTS = new Set(["mixcloud.com", "www.mixcloud.com"]);
 const TWITCH_HOSTS = new Set(["twitch.tv", "clips.twitch.tv"]);
 
 // Streaming manifest patterns — file extension in the path or query string.
@@ -35,6 +36,7 @@ export function detectSource(url: string): Source | null {
   if (!host) return null;
   if (YOUTUBE_HOSTS.has(host)) return "youtube";
   if (SOUNDCLOUD_HOSTS.has(host)) return "soundcloud";
+  if (MIXCLOUD_HOSTS.has(host)) return "mixcloud";
   if (TWITCH_HOSTS.has(host)) return "twitch";
   if (isManifestUrl(url)) return "generic";
   return null;

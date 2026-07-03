@@ -13,6 +13,11 @@ test("detectSource: soundcloud hosts", () => {
   expect(detectSource("https://on.soundcloud.com/abc123")).toBe("soundcloud");
 });
 
+test("detectSource: mixcloud hosts", () => {
+  expect(detectSource("https://www.mixcloud.com/user/mix-name/")).toBe("mixcloud");
+  expect(detectSource("https://mixcloud.com/user/mix-name/")).toBe("mixcloud");
+});
+
 test("detectSource: twitch hosts", () => {
   expect(detectSource("https://www.twitch.tv/videos/1234567890")).toBe("twitch");
   expect(detectSource("https://twitch.tv/videos/1234567890")).toBe("twitch");

@@ -8,7 +8,7 @@ import ReticleCorners from "../components/ReticleCorners";
 import LyricsPanel from "../components/LyricsPanel";
 import { useAuth } from "../hooks/useAuth";
 
-type Source = "youtube" | "soundcloud" | "twitch" | "generic";
+type Source = "youtube" | "soundcloud" | "mixcloud" | "twitch" | "generic";
 
 interface Song {
   id: number;
@@ -522,7 +522,7 @@ export default function Room() {
                       className="flex items-center justify-center gap-1.5 text-[9px] font-mono text-ps-steel-400 hover:text-ps-iris-cyan transition-colors"
                     >
                       <Glyph name="reticle" className="w-3 h-3" />
-                      {previewSong.source === "youtube" ? "_open_in_youtube;" : previewSong.source === "soundcloud" ? "_open_in_soundcloud;" : previewSong.source === "twitch" ? "_open_in_twitch;" : "_open_stream;"}
+                      {previewSong.source === "youtube" ? "_open_in_youtube;" : previewSong.source === "soundcloud" ? "_open_in_soundcloud;" : previewSong.source === "mixcloud" ? "_open_in_mixcloud;" : previewSong.source === "twitch" ? "_open_in_twitch;" : "_open_stream;"}
                     </a>
                   </div>
                 ) : (
@@ -642,7 +642,7 @@ export default function Room() {
                     type="text"
                     value={newUrl}
                     onChange={(e) => setNewUrl(e.target.value)}
-                    placeholder="_youtube_soundcloud_twitch_or_stream_url;"
+                    placeholder="_youtube_soundcloud_mixcloud_twitch_or_stream_url;"
                     className="flex-1 px-4 py-3 bg-ps-graphite-700 border border-white/10 text-ps-fg-inv-1 placeholder-ps-steel-400 font-mono text-sm tracking-wide focus:outline-none focus:border-ps-iris-rose/40 transition-all duration-120"
                     style={{ transitionTimingFunction: "var(--ps-ease-print)" }}
                   />
