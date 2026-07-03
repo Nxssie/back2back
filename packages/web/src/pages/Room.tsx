@@ -8,7 +8,7 @@ import ReticleCorners from "../components/ReticleCorners";
 import LyricsPanel from "../components/LyricsPanel";
 import { useAuth } from "../hooks/useAuth";
 
-type Source = "youtube" | "soundcloud";
+type Source = "youtube" | "soundcloud" | "twitch" | "generic";
 
 interface Song {
   id: number;
@@ -522,7 +522,7 @@ export default function Room() {
                       className="flex items-center justify-center gap-1.5 text-[9px] font-mono text-ps-steel-400 hover:text-ps-iris-cyan transition-colors"
                     >
                       <Glyph name="reticle" className="w-3 h-3" />
-                      {previewSong.source === "youtube" ? "_open_in_youtube;" : "_open_in_soundcloud;"}
+                      {previewSong.source === "youtube" ? "_open_in_youtube;" : previewSong.source === "soundcloud" ? "_open_in_soundcloud;" : previewSong.source === "twitch" ? "_open_in_twitch;" : "_open_stream;"}
                     </a>
                   </div>
                 ) : (
@@ -642,7 +642,7 @@ export default function Room() {
                     type="text"
                     value={newUrl}
                     onChange={(e) => setNewUrl(e.target.value)}
-                    placeholder="_youtube_or_soundcloud_url;"
+                    placeholder="_youtube_soundcloud_twitch_or_stream_url;"
                     className="flex-1 px-4 py-3 bg-ps-graphite-700 border border-white/10 text-ps-fg-inv-1 placeholder-ps-steel-400 font-mono text-sm tracking-wide focus:outline-none focus:border-ps-iris-rose/40 transition-all duration-120"
                     style={{ transitionTimingFunction: "var(--ps-ease-print)" }}
                   />
@@ -659,7 +659,7 @@ export default function Room() {
               ) : (
                 <div className="space-y-2">
                   <div className="flex border border-white/10 w-fit">
-                    {(["youtube", "soundcloud"] as const).map((s) => (
+                    {(["youtube", "soundcloud", "twitch"] as const).map((s) => (
                       <button
                         key={s}
                         type="button"
@@ -670,7 +670,7 @@ export default function Room() {
                             : "text-ps-steel-400 hover:text-ps-fg-inv-2 bg-transparent"
                         }`}
                       >
-                        {s === "youtube" ? "YT" : "SC"}
+                        {s === "youtube" ? "YT" : s === "soundcloud" ? "SC" : "TW"}
                       </button>
                     ))}
                   </div>
@@ -679,7 +679,7 @@ export default function Room() {
                       type="text"
                       value={searchQuery}
                       onChange={(e) => setSearchQuery(e.target.value)}
-                      placeholder={searchSource === "youtube" ? "_search_youtube;" : "_search_soundcloud;"}
+                      placeholder={searchSource === "youtube" ? "_search_youtube;" : searchSource === "soundcloud" ? "_search_soundcloud;" : "_search_twitch;"}
                       autoFocus
                       className="flex-1 px-4 py-3 bg-ps-graphite-700 border border-white/10 text-ps-fg-inv-1 placeholder-ps-steel-400 font-mono text-sm tracking-wide focus:outline-none focus:border-ps-iris-cyan/40 transition-all duration-120"
                       style={{ transitionTimingFunction: "var(--ps-ease-print)" }}
