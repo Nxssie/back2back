@@ -28,16 +28,16 @@ and a Discord bot that joins voice chat to play it back.
 ## Architecture
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Frontend  │────▶│   Server    │────▶│   yt-dlp    │
-│  (React)    │     │   (Hono)    │     │  (Audio)    │
-└─────────────┘     └─────────────┘     └─────────────┘
-                           │
-                           ▼
-                    ┌─────────────┐
-                    │   Discord   │
-                    │     Bot     │
-                    └─────────────┘
+┌──────────────────────────┐     ┌─────────────┐
+│   Server (Hono + React)  │────▶│   yt-dlp    │
+│   API + SPA on :3001     │     │  (Audio)    │
+└──────────────────────────┘     └─────────────┘
+              │
+              ▼
+       ┌─────────────┐
+       │   Discord   │
+       │     Bot     │
+       └─────────────┘
 ```
 
 ## Development
@@ -167,8 +167,8 @@ git push   # Coolify deploys from the repo
 ```
 
 In Coolify: **+ New → Docker Compose**, point it at this repo / `docker-compose.yml`.
-The domain goes on the **`web`** service only — `server` is internal (reached
-through nginx in the web image, never published to the host).
+The domain goes on the **`server`** service — it serves both the API and the
+Vite-built frontend (no separate nginx container).
 
 ### 2. Environment variables
 
@@ -188,7 +188,7 @@ just fill in the values:
 
 ### 3. Ingress: Coolify domain as HTTP, TLS via Cloudflare
 
-- Coolify → `web` service → **Domains**: `http://b2b.nxssie.dev` (**`http://`**, not
+- Coolify → `server` service → **Domains**: `http://b2b.nxssie.dev` (**`http://`**, not
   `https://`). This stops Traefik from requesting a Let's Encrypt cert and from
   adding an http→https redirect (which would loop behind Cloudflare).
 - Only the *Domains* field is `http://` — `FRONTEND_URL` and `DISCORD_REDIRECT_URI`
@@ -215,6 +215,28 @@ curl -s https://b2b.nxssie.dev/api/auth/me   # {"user":null}
 - **502 / 523** → the tunnel can't reach Traefik on `:80` (check the Public Hostname
   service URL).
 - **Redirect loop** → the Domains field is still `https://` (must be `http://`).
+
+## VPS Requirements
+
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| **CPU** | 1 core | 2 cores |
+| **RAM** | 1 GB | 2 GB |
+| **Storage** | 5 GB SSD | 10 GB SSD |
+| **Bandwidth** | 500 GB/month | 1 TB/month |
+
+The merged server container (API + SPA + Discord bot) runs under 768 MB in
+steady state. Add a **swap file** on RAM-constrained VPS to absorb transient
+yt-dlp/ffmpeg spikes:
+
+```bash
+sudo fallocate -l 1G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+Providers that fit: Hetzner CX22 (2 vCPU, 4 GB, ~€6/month), Contabo VPS S
+(4 vCPU, 4 GB, ~€5/month).
 
 ## TODO
 

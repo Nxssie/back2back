@@ -34,6 +34,7 @@ import { extractVideoId, isPlaylistUrl } from "./lib/youtube";
 import { detectSource, isSoundcloudSetUrl, type Source } from "./lib/sources";
 import { encodeJwt, decodeJwt } from "./lib/jwt";
 import { skipThreshold } from "./lib/voting";
+import path from "node:path";
 
 // --- Config ---
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -46,6 +47,8 @@ const DISCORD_REDIRECT_URI =
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 const IS_PROD = process.env.NODE_ENV === "production";
 const IS_DEV = process.env.NODE_ENV === "development";
+const WEB_DIST_DIR = path.join(import.meta.dirname, "../../web/dist");
+const INDEX_HTML = path.join(WEB_DIST_DIR, "index.html");
 const PORT = Number(process.env.PORT) || 3001;
 const DEFAULT_JWT_SECRET = "back2back-secret-change-in-production";
 const JWT_SECRET = process.env.JWT_SECRET || DEFAULT_JWT_SECRET;
@@ -1390,6 +1393,22 @@ app.post("/api/admin/guilds/:guildId/reject", async (c) => {
   console.log(`❌ Guild ${guildId} rejected by ${user.username}`);
   return c.json({ success: true });
 });
+
+// ==================== STATIC FILES (merged web) ====================
+// In production the Vite-built frontend is bundled into the server image.
+// Serve it as static files with SPA fallback for client-side routing.
+if (IS_PROD) {
+  const API_PREFIXES = ["/api", "/auth", "/health", "/ready", "/metrics"];
+  app.get("*", async (c) => {
+    const p = c.req.path;
+    if (API_PREFIXES.some((prefix) => p.startsWith(prefix))) {
+      return c.json({ error: "Not found" }, 404);
+    }
+    const file = Bun.file(path.join(WEB_DIST_DIR, p));
+    if (await file.exists()) return new Response(file);
+    return new Response(Bun.file(INDEX_HTML));
+  });
+}
 
 // ==================== DISCORD BOT ====================
 

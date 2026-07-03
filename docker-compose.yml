@@ -3,13 +3,14 @@ services:
     build:
       context: .
       dockerfile: packages/server/Dockerfile
-    # Internal only — reached through the web nginx proxy, never published to the host.
+    # Internal only — Coolify's Traefex reverse-proxies to this port.
+    # Set the service's domain (https://b2b.nxssie.dev) in the Coolify UI;
+    # no published host port needed, no Traefik labels.
     expose:
       - "3001"
     volumes:
-      # Named volume (not a relative bind mount): Coolify resolves it under the
-      # resource's managed storage and it survives redeploys without the
-      # convert-to-directory bind-mount pitfalls.
+      # Named volume: Coolify resolves it under the resource's managed storage
+      # and it survives redeploys without the convert-to-directory pitfalls.
       - b2b_data:/app/data
     environment:
       - NODE_ENV=production
@@ -26,8 +27,8 @@ services:
       - ADMIN_DISCORD_IDS=${ADMIN_DISCORD_IDS:-}
       - ROOM_TTL_HOURS=${ROOM_TTL_HOURS:-24}
     restart: unless-stopped
-    mem_limit: 1g
-    cpus: "1.5"
+    mem_limit: 768m
+    cpus: "1.0"
     healthcheck:
       # oven/bun image has no curl; use bun's fetch against /health.
       test: ["CMD", "bun", "-e", "fetch('http://localhost:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
@@ -35,39 +36,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  web:
-    build:
-      context: .
-      dockerfile: packages/web/Dockerfile
-    expose:
-      - "80"
-    depends_on:
-      server:
-        condition: service_healthy
-    restart: unless-stopped
-    mem_limit: 128m
-    cpus: "0.5"
-    healthcheck:
-      # nginx:alpine has busybox wget. Use 127.0.0.1 (not localhost): localhost
-      # resolves to ::1 first and nginx listens IPv4-only, so wget would fail
-      # forever, the container would never go healthy, and Traefik would drop it
-      # from the load balancer (503 "no available server").
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:80/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-    # No custom networks and no hardcoded Traefik labels: Coolify auto-creates
-    # the per-stack network, attaches its proxy, and generates the correct
-    # routers/TLS when you set this service's domain (https://b2b.nxssie.dev) in
-    # the Coolify UI. Declaring our own network or labels here would multi-home
-    # the container (intermittent 504s) and collide with Coolify's generated set.
     logging:
       driver: json-file
       options:
