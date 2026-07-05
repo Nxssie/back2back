@@ -25,4 +25,7 @@ export const commands = [
   new SlashCommandBuilder()
     .setName("reset")
     .setDescription("Reset all songs to be playable again"),
+  new SlashCommandBuilder()
+    .setName("room")
+    .setDescription("Show which room this server is currently playing from"),
 ].map((command) => command.toJSON());

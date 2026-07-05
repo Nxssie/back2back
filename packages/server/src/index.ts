@@ -1767,17 +1767,54 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.commandName === "stop") {
       if (!guildId) return;
+      // Disconnecting the bot affects everyone in the channel — gate to
+      // server moderators rather than any member.
+      if (!(interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageGuild) ?? false)) {
+        await interaction.reply({ content: "🚫 You need **Manage Server** permission to stop the bot.", ephemeral: true });
+        return;
+      }
       teardownGuild(guildId);
       await interaction.reply("⏹️ Stopped");
     }
 
     if (interaction.commandName === "skip") {
       if (!guildId) return;
-      const player = players.get(guildId);
-      if (player) {
-        recentSkip.add(guildId);
-        player.stop();
+      const roomId = guildRoomMap.get(guildId) || guildId;
+
+      // Mirror the web skip gate (POST /api/rooms/:id/skip): the adder can
+      // always skip, otherwise the song needs skipThreshold upvotes from the
+      // room's present listeners (web + Discord voice). Without this /skip
+      // was a one-click bypass of the vote system the web enforces.
+      const track = currentTracks.get(guildId);
+      const current = track
+        ? await db.select().from(songs).where(eq(songs.id, track.songId)).get()
+        : await db
+            .select()
+            .from(songs)
+            .where(and(eq(songs.roomId, roomId), eq(songs.played, false)))
+            .orderBy(desc(songs.votes), songs.createdAt)
+            .get();
+
+      if (!current) {
+        await interaction.reply({ content: "📭 Nothing is playing", ephemeral: true });
+        return;
       }
+
+      const threshold = skipThreshold(roomPresence(roomId));
+      const isOwner = !!current.addedByUserId && current.addedByUserId === interaction.user.id;
+      const skipVotesCount = (await db.select({ c: sql<number>`count(*)` }).from(skipVotes).where(eq(skipVotes.songId, current.id)).get())?.c ?? 0;
+      if (!isOwner && skipVotesCount < threshold) {
+        await interaction.reply({
+          content: `🗳️ Not enough votes to skip **${current.title || current.videoId}** — ${skipVotesCount}/${threshold}. The person who added it can skip anytime.`,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      await db.update(songs).set({ played: true }).where(eq(songs.id, current.id)).run();
+      await db.delete(skipVotes).where(eq(skipVotes.songId, current.id)).run();
+      recentSkip.add(guildId);
+      players.get(guildId)?.stop();
       await interaction.reply("⏭️ Skipped");
     }
 
@@ -1810,10 +1847,80 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.commandName === "reset") {
       if (!guildId) return;
+      // Resetting the whole queue is a room-wide action — gate to moderators.
+      if (!(interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageGuild) ?? false)) {
+        await interaction.reply({ content: "🚫 You need **Manage Server** permission to reset the queue.", ephemeral: true });
+        return;
+      }
       const roomId = guildRoomMap.get(guildId) || guildId;
 
       await db.update(songs).set({ played: false }).where(eq(songs.roomId, roomId)).run();
       await interaction.reply("🔄 Queue reset — all songs are now playable");
+    }
+
+    // Report which room this guild's playback is fed from (the guildRoomMap
+    // entry), so people in the server can see and join the same room in the
+    // browser. Falls back to the guild's own id when nothing has been bound
+    // yet — but only after /play or /listen sets the map, so a missing entry
+    // means the bot has never been started here.
+    if (interaction.commandName === "room") {
+      if (!guildId) return;
+      const roomId = guildRoomMap.get(guildId);
+      if (!roomId) {
+        await interaction.reply("📭 No room bound to this server yet. Use `/play` or `/listen` to start.");
+        return;
+      }
+
+      const room = await db.select().from(rooms).where(eq(rooms.id, roomId)).get();
+      const connected = connections.has(guildId);
+      const isDefault = roomId === guildId;
+
+      const counts = await db
+        .select({
+          total: sql<number>`count(*)`,
+          pending: sql<number>`sum(case when coalesce(${songs.played}, 0) = 0 then 1 else 0 end)`,
+        })
+        .from(songs)
+        .where(eq(songs.roomId, roomId))
+        .get();
+      const total = Number(counts?.total ?? 0);
+      const pending = Number(counts?.pending ?? 0);
+
+      let ownerLine: string | null = null;
+      if (room?.createdBy) {
+        const owner = await db
+          .select({ username: users.username })
+          .from(users)
+          .where(eq(users.id, room.createdBy))
+          .get();
+        if (owner?.username) ownerLine = `• Owner: ${owner.username}`;
+      }
+
+      let nowLine: string | null = null;
+      const track = currentTracks.get(guildId);
+      if (track) {
+        const cur = await db
+          .select({ title: songs.title, videoId: songs.videoId })
+          .from(songs)
+          .where(eq(songs.id, track.songId))
+          .get();
+        nowLine = `• Now playing: **${cur?.title || cur?.videoId || `#${track.songId}`}**`;
+      }
+
+      const header = isDefault
+        ? "🎵 This server is playing from its **default queue**"
+        : `🎵 This server is playing from room **${roomId}**`;
+      const lines = [
+        header,
+        `• Room ID: \`${roomId}\``,
+        `• Open in browser: ${FRONTEND_URL}/room/${roomId}`,
+        ownerLine,
+        `• Bot: ${connected ? "🔊 Connected" : "💤 Not connected"}`,
+        nowLine,
+        `• Songs: ${pending} pending / ${total} total`,
+      ].filter(Boolean);
+
+      await interaction.reply(lines.join("\n"));
     }
   } catch (err) {
     console.error(`Interaction '${interaction.commandName}' failed:`, err);
