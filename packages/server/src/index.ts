@@ -589,6 +589,12 @@ async function playNextFromRoom(roomId: string, guildId: string) {
 }
 
 async function playNextFromRoomInner(roomId: string, guildId: string) {
+  // Don't clobber a track that's already streaming. The current song stays
+  // `played = false` until it finishes, so without this guard we'd re-pick it
+  // and restart from scratch — re-spawning yt-dlp + ffmpeg. The Idle handler
+  // advances when the current track ends.
+  if (currentTracks.has(guildId)) return;
+
   const allSongs = await db
     .select()
     .from(songs)
