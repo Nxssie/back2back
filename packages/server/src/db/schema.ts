@@ -68,6 +68,27 @@ export const votes = sqliteTable(
   ]
 );
 
+// Skip-votes are separate from upvotes so the two intents don't collide:
+// an upvote means "I want this to play", a skip-vote means "skip it now".
+// Reusing the upvote tally as skip authority (the old model) was inverted —
+// a popular song (many upvotes) was *easier* to skip, which is backwards.
+export const skipVotes = sqliteTable(
+  "skip_votes",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    songId: integer("song_id")
+      .notNull()
+      .references(() => songs.id),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id),
+    createdAt: integer("created_at").$defaultFn(() => Math.floor(Date.now() / 1000)),
+  },
+  (t) => [
+    unique().on(t.songId, t.userId),
+  ]
+);
+
 export const guilds = sqliteTable("guilds", {
   id: text("id").primaryKey(), // Discord guild ID
   name: text("name"),
@@ -83,3 +104,4 @@ export type Room = typeof rooms.$inferSelect;
 export type Song = typeof songs.$inferSelect;
 export type Vote = typeof votes.$inferSelect;
 export type GuildRecord = typeof guilds.$inferSelect;
+export type SkipVote = typeof skipVotes.$inferSelect;
