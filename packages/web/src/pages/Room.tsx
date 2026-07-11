@@ -81,6 +81,12 @@ export default function Room() {
   // song's votes overtake the one already playing). Null when nothing is
   // actively streaming (bot not connected), so we fall back to vote order.
   const [currentSongId, setCurrentSongId] = useState<number | null>(null);
+  // Skip-vote tally for the current song + whether this user has voted.
+  // Separate from upvotes so "I want this to play" and "skip it now" don't
+  // collide (the old model reused upvotes as skip authority, which was
+  // inverted — a popular song was easier to skip).
+  const [skipVotesCount, setSkipVotesCount] = useState(0);
+  const [userSkipVote, setUserSkipVote] = useState(false);
 
   // Signatures of the last applied payload, so an unchanged 4s poll doesn't
   // rebuild a new array and re-render the whole queue.
@@ -107,6 +113,8 @@ export default function Room() {
       setPresentCount(data.presentCount ?? 1);
       setCurrentSongStartedAt(data.currentSongStartedAt ?? null);
       setCurrentSongId(data.currentSongId ?? null);
+      setSkipVotesCount(data.skipVotesCount ?? 0);
+      setUserSkipVote(!!data.userSkipVote);
     } catch {
       setError("ERR_01: fetch_failed;");
     } finally {
@@ -337,10 +345,10 @@ export default function Room() {
     }
   };
 
-  const skipSong = async () => {
-    if (!id) return;
+  const voteSkip = async () => {
+    if (!id || !user || !currentSong) return;
     try {
-      const res = await fetch(`/api/rooms/${id}/skip`, {
+      const res = await fetch(`/api/rooms/${id}/skip-vote`, {
         method: "POST",
         credentials: "include",
       });
@@ -348,21 +356,32 @@ export default function Room() {
         await fetchSongs();
       } else {
         const data = await res.json().catch(() => ({}));
-        setError(data.error || "ERR_07: skip_failed;");
+        setError(data.error || "ERR_07: skip_vote_failed;");
         setTimeout(() => setError(null), 3000);
       }
     } catch {
-      setError("ERR_07: skip_failed;");
+      setError("ERR_07: skip_vote_failed;");
       setTimeout(() => setError(null), 3000);
     }
   };
 
-  const pendingSongs = useMemo(() => songs.filter((s) => !s.played).slice(1), [songs]);
+  // Exclude the actually-streaming song (currentSong), not just "the first
+  // unplayed". Once a pending song overtakes the playing one in votes, the
+  // playing song is no longer the first unplayed — slicing the first would
+  // then hide the real next-to-play song AND render the current one twice
+  // (here and in the ON_AIR highlight). currentSong already encodes the
+  // correct anchor (currentSongId when the bot is connected, else the
+  // vote-order fallback), so excluding its id is consistent in both cases.
+  const pendingSongs = useMemo(
+    () => songs.filter((s) => !s.played && s.id !== currentSong?.id),
+    [songs, currentSong]
+  );
   const playedSongs = useMemo(() => songs.filter((s) => s.played), [songs]);
   const skipThreshold = Math.max(1, Math.ceil(presentCount / 2));
-  const canSkip = !!currentSong && (
-    currentSong.votes >= skipThreshold || user?.id === currentSong.addedByUserId
-  );
+  const isCurrentOwner = !!user && !!currentSong && currentSong.addedByUserId === user.id;
+  // The adder can skip directly; anyone else votes, and the skip auto-executes
+  // once skipVotes >= threshold (handled server-side in /skip-vote).
+  const canSkipVote = !!user && !!currentSong && (isCurrentOwner || !userSkipVote);
 
   // Group pending songs: consecutive songs sharing a playlistId are merged into
   // one entry; individual songs are their own entry.
@@ -772,20 +791,20 @@ export default function Room() {
                         />
                         <span className="text-[9px] font-mono font-bold text-ps-iris-cyan tracking-[0.14em] uppercase">_playing;</span>
                       </div>
-                      {user && (
+                      {user && currentSong && (
                         <button
-                          onClick={skipSong}
-                          disabled={!canSkip}
-                          title={canSkip ? "_skip;" : `_need_${skipThreshold}_votes;`}
+                          onClick={voteSkip}
+                          disabled={!canSkipVote}
+                          title={isCurrentOwner ? "_skip;" : userSkipVote ? "_voted;" : `_need_${skipThreshold}_votes;`}
                           className={`flex items-center gap-1.5 px-2.5 py-1 border text-[9px] font-mono font-bold tracking-[0.12em] uppercase transition-all duration-120 ${
-                            canSkip
+                            canSkipVote
                               ? "border-ps-steel-400/40 bg-ps-ink-800 text-ps-fg-inv-1 hover:border-ps-signal-danger/50 hover:text-ps-signal-danger cursor-pointer"
                               : "border-white/10 bg-transparent text-ps-steel-400/50 cursor-not-allowed"
                           }`}
                           style={{ transitionTimingFunction: "var(--ps-ease-print)" }}
                         >
-                          <Glyph name="chevron-up" className="w-3 h-3 rotate-90" />
-                          {currentSong.votes}/{skipThreshold}
+                          <Glyph name={userSkipVote && !isCurrentOwner ? "check" : "chevron-up"} className="w-3 h-3 rotate-90" />
+                          {isCurrentOwner ? "SKIP" : `${skipVotesCount}/${skipThreshold}`}
                         </button>
                       )}
                     </div>

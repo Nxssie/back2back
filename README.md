@@ -150,6 +150,7 @@ YouTube, SoundCloud, Mixcloud, or Twitch URL:
 - `/skip` — Skip the current song
 - `/queue` — Show the current queue
 - `/reset` — Mark all songs as playable again
+- `/room` — Show which room this server is currently playing from
 
 ## Deploy (Coolify + Cloudflare Tunnel)
 
