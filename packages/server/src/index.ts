@@ -14,6 +14,9 @@ import {
   PermissionsBitField,
   ActionRowBuilder,
   StringSelectMenuBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
   type ChatInputCommandInteraction,
   type StringSelectMenuInteraction,
   type VoiceBasedChannel,
@@ -41,6 +44,7 @@ import { skipThreshold } from "./lib/voting";
 import { YTDLP_BASE_ARGS, YTDLP_DOWNLOAD_ARGS } from "./lib/ytdlp";
 import { searchTracks, toSelectOptions, type SearchableSource } from "./lib/search";
 import { encodeId, decodeId } from "./lib/components";
+import { formatQueuePage, clampPage, slicePage, type QueueSong } from "./lib/queue";
 import path from "node:path";
 
 // --- Config ---
@@ -1647,8 +1651,93 @@ async function queueTrackForGuild(
   await interaction.editReply({ content: `Added to queue: **${title || url}**`, components: [] });
 }
 
+// The queue read-model every /queue surface shares: the unplayed, vote-ordered
+// rows the HTTP songs route and auto-advance already use, so the command and
+// its buttons, selects, and re-renders can never disagree about what is queued.
+async function loadQueue(roomId: string): Promise<QueueSong[]> {
+  const rows = await db
+    .select()
+    .from(songs)
+    .where(eq(songs.roomId, roomId))
+    .orderBy(desc(songs.votes), songs.createdAt)
+    .all();
+  return rows.filter((s) => !s.played);
+}
+
+// Rebuild the whole panel from a freshly loaded queue. A stale message left in
+// a channel must never render or act on state the database no longer has.
+function queuePanel(queue: QueueSong[], page: number, guildId: string, userId: string) {
+  const view = formatQueuePage(queue, page);
+  const pageSongs = slicePage(queue, view.page);
+
+  const components: (
+    | ActionRowBuilder<ButtonBuilder>
+    | ActionRowBuilder<StringSelectMenuBuilder>
+  )[] = [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(encodeId("q_prev", view.page, guildId))
+        .setLabel("◀ Previous")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(view.page <= 1),
+      new ButtonBuilder()
+        .setCustomId(encodeId("q_refresh", view.page, guildId))
+        .setLabel("🔄 Refresh")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(encodeId("q_next", view.page, guildId))
+        .setLabel("Next ▶")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(view.page >= view.pageCount)
+    ),
+  ];
+
+  // Discord rejects a select with zero options, so an empty page drops the row.
+  if (pageSongs.length > 0) {
+    components.push(
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(encodeId("q_vote", view.page, guildId))
+          .setPlaceholder("Upvote a song")
+          .addOptions(
+            pageSongs.map((s) => ({
+              label: (s.title?.trim() || s.videoId).slice(0, 100),
+              value: String(s.id),
+            }))
+          )
+      )
+    );
+  }
+
+  // Only the songs this user added are removable, and an empty select is
+  // rejected by Discord — so omit the row entirely when the page has none.
+  const mine = pageSongs.filter((s) => s.addedByUserId === userId);
+  if (mine.length > 0) {
+    components.push(
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(encodeId("q_remove", view.page, guildId))
+          .setPlaceholder("Remove one of your songs")
+          .addOptions(
+            mine.map((s) => ({
+              label: (s.title?.trim() || s.videoId).slice(0, 100),
+              value: String(s.id),
+            }))
+          )
+      )
+    );
+  }
+
+  return { embeds: [new EmbedBuilder().setDescription(view.text)], components };
+}
+
 discord.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand() && !interaction.isStringSelectMenu()) return;
+  if (
+    !interaction.isChatInputCommand() &&
+    !interaction.isStringSelectMenu() &&
+    !interaction.isButton()
+  )
+    return;
   const { guildId } = interaction;
 
   // Gate on guild approval: pending or unknown guilds can't use bot commands.
@@ -1675,6 +1764,77 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         }
         await queueTrackForGuild(interaction, guildId, url, source);
       }
+
+      // Queue panel selects. The page rides in the customId so the re-render
+      // lands on the page the user was looking at.
+      if (decoded?.action === "q_vote" || decoded?.action === "q_remove") {
+        const guild = decoded.args[1];
+        const page = Number(decoded.args[0]);
+        const songId = Number(interaction.values[0]);
+        if (!guild || !Number.isFinite(songId)) return;
+        const roomId = guildRoomMap.get(guild) || guild;
+        const song = await db.select().from(songs).where(eq(songs.id, songId)).get();
+        const before = await loadQueue(roomId);
+
+        if (!song) {
+          await interaction.update(queuePanel(before, page, guild, interaction.user.id));
+          await interaction.followUp({ content: "⚠️ That song is no longer in the queue.", ephemeral: true });
+          return;
+        }
+
+        if (decoded.action === "q_vote") {
+          const existing = await db
+            .select()
+            .from(votes)
+            .where(and(eq(votes.songId, songId), eq(votes.userId, interaction.user.id)))
+            .get();
+          if (existing) {
+            await interaction.update(queuePanel(before, page, guild, interaction.user.id));
+            await interaction.followUp({ content: `🗳️ You already upvoted **${song.title || song.videoId}**.`, ephemeral: true });
+            return;
+          }
+          await db.insert(votes).values({ songId, userId: interaction.user.id }).run();
+          await db.update(songs).set({ votes: (song.votes ?? 0) + 1 }).where(eq(songs.id, songId)).run();
+          await interaction.update(queuePanel(await loadQueue(roomId), page, guild, interaction.user.id));
+          await interaction.followUp({ content: `👍 Upvoted **${song.title || song.videoId}**.`, ephemeral: true });
+          return;
+        }
+
+        // Same gate as DELETE /api/rooms/:id/songs/:songId: the song's adder or
+        // a global admin (ADMIN_DISCORD_IDS holds raw Discord user ids).
+        const isOwner = !!song.addedByUserId && song.addedByUserId === interaction.user.id;
+        if (!isOwner && !ADMIN_DISCORD_IDS.has(interaction.user.id)) {
+          await interaction.update(queuePanel(before, page, guild, interaction.user.id));
+          await interaction.followUp({ content: "🚫 You can only remove songs you added.", ephemeral: true });
+          return;
+        }
+        await db.transaction(async (tx) => {
+          await tx.delete(votes).where(eq(votes.songId, songId));
+          await tx.delete(skipVotes).where(eq(skipVotes.songId, songId));
+          await tx.delete(songs).where(eq(songs.id, songId));
+        });
+        await interaction.update(queuePanel(await loadQueue(roomId), page, guild, interaction.user.id));
+        await interaction.followUp({ content: `🗑️ Removed **${song.title || song.videoId}**.`, ephemeral: true });
+        return;
+      }
+      return;
+    }
+
+    if (interaction.isButton()) {
+      const decoded = decodeId(interaction.customId);
+      if (!decoded || !["q_prev", "q_refresh", "q_next"].includes(decoded.action)) return;
+      const guild = decoded.args[1];
+      const requested = Number(decoded.args[0]);
+      if (!guild) return;
+      const roomId = guildRoomMap.get(guild) || guild;
+      const queue = await loadQueue(roomId);
+      // Clamp against the queue as it is now, not as it was when the panel was
+      // rendered — songs get voted, removed, or played out while it sits idle.
+      const target =
+        decoded.action === "q_prev" ? requested - 1 : decoded.action === "q_next" ? requested + 1 : requested;
+      await interaction.update(
+        queuePanel(queue, clampPage(target, queue.length), guild, interaction.user.id)
+      );
       return;
     }
 
@@ -1800,28 +1960,10 @@ discord.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.commandName === "queue") {
       if (!guildId) return;
       const roomId = guildRoomMap.get(guildId) || guildId;
-
-      const queue = db
-        .select()
-        .from(songs)
-        .where(eq(songs.roomId, roomId))
-        .orderBy(desc(songs.votes), songs.createdAt)
-        .all()
-        .filter((s) => !s.played);
-
-      if (queue.length === 0) {
-        await interaction.reply("📭 Queue is empty");
-        return;
-      }
-
-      const list = queue
-        .map(
-          (s, i) =>
-            `${i + 1}. **${s.title || s.videoId}** (votes: ${s.votes}) — by ${s.addedBy}`
-        )
-        .join("\n");
-
-      await interaction.reply(`🎵 **Queue:**\n${list}`);
+      const queue = await loadQueue(roomId);
+      // Public, not ephemeral: this panel is the shared queue everyone in the
+      // channel votes and removes from.
+      await interaction.reply(queuePanel(queue, 1, guildId, interaction.user.id));
     }
 
     if (interaction.commandName === "reset") {
