@@ -34,6 +34,8 @@ import { extractVideoId, isPlaylistUrl } from "./lib/youtube";
 import { detectSource, isSoundcloudSetUrl, type Source } from "./lib/sources";
 import { encodeJwt, decodeJwt } from "./lib/jwt";
 import { skipThreshold } from "./lib/voting";
+import { YTDLP_BASE_ARGS, YTDLP_DOWNLOAD_ARGS } from "./lib/ytdlp";
+import { searchTracks, type SearchableSource } from "./lib/search";
 import path from "node:path";
 
 // --- Config ---
@@ -100,21 +102,6 @@ const ALONE_LEAVE_MS = 60 * 1000;
 function isAdmin(user: User | null): boolean {
   return !!user && ADMIN_DISCORD_IDS.has(user.id);
 }
-
-// Optional yt-dlp hardening for servers whose IP YouTube rate-limits/blocks
-// (datacenter IPs frequently hit "Sign in to confirm you're not a bot" / 403,
-// which makes tracks fail to extract and end almost instantly). Set these in the
-// environment — no code change needed — to recover playback:
-//   YTDLP_COOKIES=/app/data/cookies.txt          Netscape cookie jar from a logged-in session
-//   YTDLP_EXTRACTOR_ARGS=youtube:player_client=default,mweb
-//   YTDLP_DOWNLOADER=ffmpeg                        more robust for fragmented/SABR streams
-const YTDLP_BASE_ARGS: string[] = [
-  ...(process.env.YTDLP_COOKIES ? ["--cookies", process.env.YTDLP_COOKIES] : []),
-  ...(process.env.YTDLP_EXTRACTOR_ARGS ? ["--extractor-args", process.env.YTDLP_EXTRACTOR_ARGS] : []),
-];
-const YTDLP_DOWNLOAD_ARGS: string[] = process.env.YTDLP_DOWNLOADER
-  ? ["--downloader", process.env.YTDLP_DOWNLOADER]
-  : [];
 
 // --- State (in-memory; this is a deliberately single-instance service) ---
 const players = new Map<string, AudioPlayer>();
@@ -1362,78 +1349,9 @@ app.get("/api/search", async (c) => {
 
   const n = Math.min(Number(c.req.query("n") || 5), 10);
   const rawSource = c.req.query("source");
-  const source: Source = rawSource === "soundcloud" ? "soundcloud" : rawSource === "twitch" ? "twitch" : "youtube";
-  const searchPrefix = source === "youtube" ? "ytsearch" : source === "twitch" ? "twitchsearch" : "scsearch";
+  const source: SearchableSource = rawSource === "soundcloud" ? "soundcloud" : rawSource === "twitch" ? "twitch" : "youtube";
 
-  type SearchResult = {
-    source: Source;
-    videoId: string;
-    title: string;
-    duration: number | null;
-    uploader: string | null;
-    url: string;
-    thumbnail: string | null;
-  };
-  const results = await new Promise<SearchResult[]>((resolve) => {
-    const proc = spawn(
-      "yt-dlp",
-      [`${searchPrefix}${n}:${q}`, "--dump-json", "--flat-playlist", "--no-warnings", ...YTDLP_BASE_ARGS],
-      { stdio: ["ignore", "pipe", "ignore"] }
-    );
-
-    let output = "";
-    let done = false;
-    const finish = (val: SearchResult[]) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      resolve(val);
-    };
-    // Kill a hung yt-dlp instead of leaking the process and never responding.
-    const timer = setTimeout(() => {
-      try { proc.kill("SIGKILL"); } catch {}
-      finish([]);
-    }, 15_000);
-
-    proc.stdout.on("data", (chunk: Buffer) => {
-      output += chunk.toString();
-      // Cap the buffer so a pathological response can't exhaust memory.
-      if (output.length > 1_000_000) {
-        try { proc.kill("SIGKILL"); } catch {}
-        finish([]);
-      }
-    });
-    proc.on("close", () => {
-      const parsed = output
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .flatMap((line) => {
-          try {
-            const e = JSON.parse(line);
-            if (!e.id || !e.title) return [];
-            const videoId = String(e.id);
-            const url = source === "youtube"
-              ? `https://www.youtube.com/watch?v=${videoId}`
-              : String(e.webpage_url || e.url || "");
-            if (!url) return [];
-            const thumbnail = source === "youtube"
-              ? `https://i.ytimg.com/vi/${videoId}/default.jpg`
-              : (e.thumbnail ?? e.thumbnails?.at(-1)?.url ?? null);
-            return [{ source, videoId, title: String(e.title), duration: e.duration ?? null, uploader: e.uploader ?? null, url, thumbnail }];
-          } catch {
-            return [];
-          }
-        });
-      finish(parsed);
-    });
-    proc.on("error", () => finish([]));
-    // Cancel the spawn if the client disconnects mid-request.
-    c.req.raw.signal?.addEventListener("abort", () => {
-      try { proc.kill("SIGKILL"); } catch {}
-      finish([]);
-    });
-  });
+  const results = await searchTracks(q, source, n, c.req.raw.signal);
 
   return c.json({ results });
 });
