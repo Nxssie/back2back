@@ -11,6 +11,22 @@ export const commands = [
       option.setName("url").setDescription("YouTube, SoundCloud, Mixcloud, or Twitch URL").setRequired(true)
     ),
   new SlashCommandBuilder()
+    .setName("search")
+    .setDescription("Search for a track and queue it")
+    .addStringOption((option) =>
+      option.setName("query").setDescription("Track or artist to search for").setRequired(true)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("source")
+        .setDescription("Where to search")
+        .addChoices(
+          { name: "YouTube", value: "youtube" },
+          { name: "SoundCloud", value: "soundcloud" },
+          { name: "Twitch", value: "twitch" }
+        )
+    ),
+  new SlashCommandBuilder()
     .setName("listen")
     .setDescription("Join voice channel and start the queue"),
   new SlashCommandBuilder()

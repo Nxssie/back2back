@@ -12,6 +12,10 @@ import {
   REST,
   Routes,
   PermissionsBitField,
+  ActionRowBuilder,
+  StringSelectMenuBuilder,
+  type ChatInputCommandInteraction,
+  type StringSelectMenuInteraction,
   type VoiceBasedChannel,
 } from "discord.js";
 import {
@@ -35,7 +39,8 @@ import { detectSource, isSoundcloudSetUrl, type Source } from "./lib/sources";
 import { encodeJwt, decodeJwt } from "./lib/jwt";
 import { skipThreshold } from "./lib/voting";
 import { YTDLP_BASE_ARGS, YTDLP_DOWNLOAD_ARGS } from "./lib/ytdlp";
-import { searchTracks, type SearchableSource } from "./lib/search";
+import { searchTracks, toSelectOptions, type SearchableSource } from "./lib/search";
+import { encodeId, decodeId } from "./lib/components";
 import path from "node:path";
 
 // --- Config ---
@@ -1591,8 +1596,59 @@ discord.on(Events.GuildDelete, async (guild) => {
   console.log(`🗑️ Guild "${guild.name}" (${guild.id}) removed`);
 });
 
+// Queue a track for a guild: the voice gate, room resolution and play-order
+// live here so /play and the /search picker cannot drift apart. Callers own
+// URL/source validation and the interaction has already been acknowledged iff
+// `interaction.replied`/`deferred` is set.
+async function queueTrackForGuild(
+  interaction: ChatInputCommandInteraction | StringSelectMenuInteraction,
+  guildId: string,
+  url: string,
+  source: Source
+) {
+  const voiceChannel = interaction.member?.voice?.channel as VoiceBasedChannel | null | undefined;
+  if (!voiceChannel) {
+    if (interaction.deferred || interaction.replied) await interaction.editReply("You need to be in a voice channel!");
+    else await interaction.reply("You need to be in a voice channel!");
+    return;
+  }
+
+  if (!interaction.deferred && !interaction.replied) await interaction.deferReply();
+
+  const roomId = guildRoomMap.get(guildId) || userCurrentRoom.get(interaction.user.id) || guildId;
+
+  await ensureRoom(roomId, interaction.user.id);
+
+  const resolved = await resolveSingleTrack(url, source);
+  if (!resolved) {
+    await interaction.editReply("Could not resolve track");
+    return;
+  }
+  const { title, uploader, thumbnail } = resolved;
+
+  await db.insert(songs).values({
+    roomId,
+    videoId: resolved.videoId,
+    source,
+    url: resolved.url,
+    title,
+    uploader,
+    thumbnail,
+    addedBy: interaction.user.username,
+    addedByUserId: interaction.user.id,
+  });
+
+  await new Promise((r) => setTimeout(r, 50));
+
+  guildRoomMap.set(guildId, roomId);
+  await connectToVoiceChannel(guildId, voiceChannel.id);
+  await playNextFromRoom(roomId, guildId);
+
+  await interaction.editReply({ content: `Added to queue: **${title || url}**`, components: [] });
+}
+
 discord.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+  if (!interaction.isChatInputCommand() && !interaction.isStringSelectMenu()) return;
   const { guildId } = interaction;
 
   // Gate on guild approval: pending or unknown guilds can't use bot commands.
@@ -1605,6 +1661,23 @@ discord.on(Events.InteractionCreate, async (interaction) => {
   }
 
   try {
+    if (interaction.isStringSelectMenu()) {
+      const decoded = decodeId(interaction.customId);
+      if (decoded?.action === "search_pick") {
+        // The URL is the payload, so this needs no server-side state and still
+        // works after a restart. Drop the picker up front so it can't queue twice.
+        const url = interaction.values[0];
+        const source = url ? detectSource(url) : null;
+        await interaction.update({ components: [] });
+        if (!guildId || !url || !source) {
+          await interaction.editReply({ content: "⚠️ That search result can no longer be played.", components: [] });
+          return;
+        }
+        await queueTrackForGuild(interaction, guildId, url, source);
+      }
+      return;
+    }
+
     if (interaction.commandName === "play") {
       const url = interaction.options.getString("url");
       if (!url || !guildId) {
@@ -1617,47 +1690,35 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      const voiceChannel = interaction.member?.voice?.channel as
-        | VoiceBasedChannel
-        | null
-        | undefined;
-      if (!voiceChannel) {
-        await interaction.reply("You need to be in a voice channel!");
+      await queueTrackForGuild(interaction, guildId, url, source);
+    }
+
+    if (interaction.commandName === "search") {
+      if (!guildId) return;
+      const query = interaction.options.getString("query");
+      const source = (interaction.options.getString("source") ?? "youtube") as SearchableSource;
+
+      // yt-dlp takes seconds, so acknowledge first and edit with the results.
+      await interaction.deferReply({ ephemeral: true });
+      if (!query) {
+        await interaction.editReply("Provide something to search for.");
         return;
       }
 
-      await interaction.deferReply();
-
-      const roomId = guildRoomMap.get(guildId) || userCurrentRoom.get(interaction.user.id) || guildId;
-
-      await ensureRoom(roomId, interaction.user.id);
-
-      const resolved = await resolveSingleTrack(url, source);
-      if (!resolved) {
-        await interaction.editReply("Could not resolve track");
+      const options = toSelectOptions(await searchTracks(query, source, 10));
+      if (options.length === 0) {
+        await interaction.editReply(`🔍 No results for **${query}**.`);
         return;
       }
-      const { title, uploader, thumbnail } = resolved;
 
-      await db.insert(songs).values({
-        roomId,
-        videoId: resolved.videoId,
-        source,
-        url: resolved.url,
-        title,
-        uploader,
-        thumbnail,
-        addedBy: interaction.user.username,
-        addedByUserId: interaction.user.id,
+      const select = new StringSelectMenuBuilder()
+        .setCustomId(encodeId("search_pick"))
+        .setPlaceholder(`Pick a ${source} result`)
+        .addOptions(options);
+      await interaction.editReply({
+        content: `🔍 Results for **${query}** — pick one to queue:`,
+        components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)],
       });
-
-      await new Promise((r) => setTimeout(r, 50));
-
-      guildRoomMap.set(guildId, roomId);
-      await connectToVoiceChannel(guildId, voiceChannel.id);
-      await playNextFromRoom(roomId, guildId);
-
-      await interaction.editReply(`Added to queue: **${title || url}**`);
     }
 
     if (interaction.commandName === "listen") {
@@ -1841,7 +1902,8 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       await interaction.reply(lines.join("\n"));
     }
   } catch (err) {
-    console.error(`Interaction '${interaction.commandName}' failed:`, err);
+    const label = interaction.isChatInputCommand() ? `'${interaction.commandName}'` : `component '${interaction.customId}'`;
+    console.error(`Interaction ${label} failed:`, err);
     try {
       const msg = "⚠️ Something went wrong handling that command.";
       if (interaction.deferred || interaction.replied) await interaction.editReply(msg);
