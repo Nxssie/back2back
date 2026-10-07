@@ -7,10 +7,11 @@ feature parity via slash commands and message components.
 
 | Field | Value |
 |---|---|
-| State | planned — awaiting go-ahead to implement |
-| Branch | `feat/bot-only-migration` (not created yet) |
+| State | in progress — Slice A, 7 of 13 tasks done |
+| Branch | `feat/bot-only-migration` |
 | Slices | A (additive bot surface) → B (room semantics) → C (delete web + auth) |
 | Tasks | 20 |
+| Blocked on | Slice A13 needs a live Discord app to smoke-test; Slice C must not start before it passes |
 
 ## Decisions locked
 
@@ -56,20 +57,20 @@ against the new code before anything is deleted.
 Everything here is new code plus extraction of existing HTTP logic into shared,
 testable modules. Nothing breaks if Slice A lands alone.
 
-- [ ] **A1. Branch + lockfile** — create `feat/bot-only-migration`.
-- [ ] **A2. `lib/queue.ts` (test-first)** — pure queue read-model: page slicing,
+- [x] **A1. Branch + lockfile** — create `feat/bot-only-migration`. `9229752`
+- [x] **A2. `lib/queue.ts` (test-first)** — pure queue read-model: page slicing,
        pagination math, embed assembly, 2000-char-safe truncation.
-       Fixes the existing `/queue` overflow defect (index.ts:1839).
-- [ ] **A3. `lib/components.ts` (test-first)** — stateless customId codec
-       (`b2b:<action>:<payload>`, ≤100 chars, round-trip tests). Survives restarts.
-- [ ] **A4. `lib/search.ts`** — extract the yt-dlp search spawn out of
+       Fixes the existing `/queue` overflow defect (see Correction below). `d06ca59`
+- [x] **A3. `lib/components.ts` (test-first)** — stateless customId codec
+       (`b2b:<action>:<payload>`, ≤100 chars, round-trip tests). Survives restarts. `14625d6`
+- [x] **A4. `lib/search.ts`** — extract the yt-dlp search spawn out of
        `GET /api/search` into a shared function; add result→choice mapping tests
-       (25 cap, 100-char labels, dedupe). HTTP route delegates to it.
-- [ ] **A5. `lib/lyrics.ts`** — move `web/src/lib/lyrics.ts` to the server,
-       add tests + truncation helper.
-- [ ] **A6. `/search`** — deferReply(ephemeral) → select menu → queue the pick.
-- [ ] **A7. `/queue` panel** — embed + pagination buttons + upvote select +
-       remove-mine select, handled in `InteractionCreate` (no collectors).
+       (25 cap, 100-char labels, dedupe). HTTP route delegates to it. `1ba7623`
+- [x] **A5. `lib/lyrics.ts`** — move `web/src/lib/lyrics.ts` to the server,
+       add tests + truncation helper. `c86639a`
+- [x] **A6. `/search`** — deferReply(ephemeral) → select menu → queue the pick. `6cd1d83`
+- [x] **A7. `/queue` panel** — embed + pagination buttons + upvote select +
+       remove-mine select, handled in `InteractionCreate` (no collectors). `8fd6204`
 - [ ] **A8. Now-playing message** — post/edit per track in the bound channel,
        with skip-vote / skip / force-skip buttons.
 - [ ] **A9. `/lyrics`** — ephemeral plain text for the current track.
@@ -78,8 +79,9 @@ testable modules. Nothing breaks if Slice A lands alone.
        (index.ts:1679) so a new guild can be bootstrapped.
 - [ ] **A11. `/help`** — ephemeral command index.
 - [ ] **A12. Register all new commands** in `commands.ts` + `deploy-commands.ts`.
+       (`deploy-commands.ts` consumes the exported array, so only `commands.ts` changes.)
 - [ ] **A13. Smoke pass** — verify A6–A11 against live Discord with the web still
-       running, so both UIs can be compared.
+       running, so both UIs can be compared. **Requires a live bot; blocked on the user.**
 
 ### Slice B — room semantics = guild
 
@@ -133,6 +135,35 @@ the fallback UI.
 | Approval-gate deadlock after web removal | A10 exempts admin IDs from the gate |
 | Deleting the web is hard to reverse mid-flight | Slices A→B→C; C only after A13 passes |
 
+## Correction: the `/queue` defect was a crash, not an overflow
+
+This plan originally reported that `/queue` broke past roughly twenty songs
+because it joined every unplayed song into one untruncated string.
+
+The real defect was worse. At the pre-migration revision the handler called
+`db.select().from(songs)...orderBy(...).all().filter((s) => !s.played)` without
+awaiting, and `.all()` returns a **Promise** with the `drizzle-orm/libsql`
+driver this repo uses (`packages/server/src/db/index.ts`). `.filter` on a
+Promise throws `TypeError: ... .filter is not a function`, the outer handler
+catch swallows it, and the user gets "⚠️ Something went wrong handling that
+command." **`/queue` never worked, for any guild, at any queue length.**
+
+Verified empirically against the repo's own driver stack:
+
+```
+typeof res: object | isPromise: true
+filter THROWS: TypeError: res.filter is not a function
+awaited filter: 1
+```
+
+The truncation issue was therefore not observable — the command never reached
+the string join. Both are fixed by A2 and A7: `loadQueue()` awaits, and
+`formatQueuePage()` paginates.
+
+This also materially supports the premise of the migration. If `/queue` was
+dead, the web was the only working way to see a queue, which is consistent with
+users settling on the SPA for everything except `/play`, `/skip`, and `/stop`.
+
 ## Open questions
 
 1. Slice B4: migrate existing room rows to guild ids, or let GC drop them?
@@ -141,6 +172,22 @@ the fallback UI.
 
 ## Evidence log
 
-| Date | Task | Evidence |
+| Commit | Task | Evidence |
 |---|---|---|
-| — | — | (filled in as tasks close) |
+| `9229752` | A1 | Branch `feat/bot-only-migration` created from `main`. |
+| `d06ca59` | A2 | `lib/queue.ts` + 18 tests. RED: `Cannot find module './queue'`. GREEN: `bun test packages/server/src/lib/queue.test.ts` → 18 pass, 0 fail, 48 expect() calls. |
+| `14625d6` | A3 | `lib/components.ts` + 10 tests. RED: `Cannot find module './components'`. GREEN: 10 pass, 0 fail, 25 expect() calls. Full suite 54 pass. |
+| `1ba7623` | A4 | `lib/ytdlp.ts`, `lib/search.ts` + 8 tests; `index.ts` −86/+4. RED: module missing, then GREEN 8 pass. Full suite 62 pass. `git diff` confirms the spawn block moved verbatim apart from renames. |
+| `c86639a` | A5 | `lib/lyrics.ts` + 6 tests. RED: module missing, then GREEN. Full suite 68 pass. |
+| `6cd1d83` | A6 | `/search` + `search_pick` handler; `queueTrackForGuild()` extracted from `/play` (index.ts:1603). Full suite 68 pass. **Live interaction path unverified.** |
+| `8fd6204` | A7 | `/queue` panel; `loadQueue()` (index.ts:1657) and `queuePanel()` (index.ts:1669). Full suite 68 pass. **Live interaction path unverified.** |
+
+### Verification gap
+
+Every Slice A interaction path (A6, A7, and A8 onward) is only **structurally
+verified**: `bun test` never loads `index.ts`, and the repo has no Discord
+interaction harness. No live bot session was available. A13 exists to close this
+gap and is a hard gate on Slice C.
+
+The pure logic behind those paths (`lib/queue.ts`, `lib/components.ts`,
+`lib/search.ts`, `lib/lyrics.ts`) is test-first covered.
