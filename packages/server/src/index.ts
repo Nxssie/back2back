@@ -80,7 +80,6 @@ const ALONE_LEAVE_MS = 60 * 1000;
 // --- State (in-memory; this is a deliberately single-instance service) ---
 const players = new Map<string, AudioPlayer>();
 const connections = new Map<string, VoiceConnection>();
-const guildRoomMap = new Map<string, string>();
 // Where each guild's now-playing card lives. Discord gives no text channel for
 // a voice channel, so the channel is remembered from whichever channel a
 // command was used in, and the card is edited in place from track to track.
@@ -429,9 +428,6 @@ function teardownGuild(guildId: string) {
   recentSkip.delete(guildId);
   emptySince.delete(guildId);
   aloneSince.delete(guildId);
-  // Drop the room mapping BEFORE stopping the player: stop() fires Idle, and the
-  // Idle handler must not find a room to advance into while we're tearing down.
-  guildRoomMap.delete(guildId);
   const track = currentTracks.get(guildId);
   track?.cleanup();
   currentTracks.delete(guildId);
@@ -453,21 +449,24 @@ function setupPlayer(guildId: string): AudioPlayer {
 
   player.on(AudioPlayerStatus.Idle, async () => {
     const track = currentTracks.get(guildId);
-    const playedMs = track ? Date.now() - track.startedAt : 0;
-    const wasSkip = recentSkip.delete(guildId); // consume the skip marker, if any
-    if (track) {
-      track.cleanup();
-      await db.update(songs).set({ played: true }).where(eq(songs.id, track.songId)).run();
-      await db.delete(skipVotes).where(eq(skipVotes.songId, track.songId)).run();
-      currentTracks.delete(guildId);
-    }
+    // teardownGuild clears currentTracks before stopping the player, and stop()
+    // emits this synchronously, so a teardown (or a duplicate Idle) must not
+    // reach the advance and failure logic below — that used to be prevented by
+    // the room binding being deleted first.
+    if (!track) return;
 
-    const roomId = guildRoomMap.get(guildId);
-    if (!roomId) return;
+    const playedMs = Date.now() - track.startedAt;
+    const wasSkip = recentSkip.delete(guildId); // consume the skip marker, if any
+    track.cleanup();
+    await db.update(songs).set({ played: true }).where(eq(songs.id, track.songId)).run();
+    await db.delete(skipVotes).where(eq(skipVotes.songId, track.songId)).run();
+    currentTracks.delete(guildId);
+
+    const roomId = guildId;
 
     // Healthy advance: an intentional user skip, or a track that actually played
     // for a while. Reset the failure streak and move on immediately.
-    if (wasSkip || !track || playedMs >= FAST_FAIL_MS) {
+    if (wasSkip || playedMs >= FAST_FAIL_MS) {
       consecutiveFailures.set(guildId, 0);
       console.log(`⏹️ Track finished in guild ${guildId} (${(playedMs / 1000).toFixed(0)}s)`);
       await playNextFromRoom(roomId, guildId);
@@ -781,9 +780,6 @@ app.get("/metrics", async (c) => {
   });
 });
 
-// Track which room each Discord user is viewing
-const userCurrentRoom = new Map<string, string>(); // userId -> roomId
-
 // ==================== DISCORD BOT ====================
 
 discord.once(Events.ClientReady, async (c) => {
@@ -814,6 +810,8 @@ discord.once(Events.ClientReady, async (c) => {
       }).run();
     }
   }
+
+  try { await purgeUnreachableRooms(); } catch (err) { console.error("purgeUnreachableRooms failed:", err); }
 });
 
 // New guilds start as pending approval — the bot joins but stays dormant
@@ -859,7 +857,7 @@ async function queueTrackForGuild(
 
   if (!interaction.deferred && !interaction.replied) await interaction.deferReply();
 
-  const roomId = guildRoomMap.get(guildId) || userCurrentRoom.get(interaction.user.id) || guildId;
+  const roomId = guildId;
 
   await ensureRoom(roomId, interaction.user.id);
 
@@ -914,7 +912,6 @@ async function queueTrackForGuild(
 
   await new Promise((r) => setTimeout(r, 50));
 
-  guildRoomMap.set(guildId, roomId);
   await connectToVoiceChannel(guildId, voiceChannel.id);
   await playNextFromRoom(roomId, guildId);
 
@@ -1128,7 +1125,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         const page = Number(decoded.args[0]);
         const songId = Number(interaction.values[0]);
         if (!guild || !Number.isFinite(songId)) return;
-        const roomId = guildRoomMap.get(guild) || guild;
+        const roomId = guild;
         const song = await db.select().from(songs).where(eq(songs.id, songId)).get();
         const before = await loadQueue(roomId);
 
@@ -1186,7 +1183,8 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       if (decoded.action === "p_skipvote" || decoded.action === "p_skip") {
         const guild = decoded.args[0];
         if (!guild) return;
-        const roomId = guildRoomMap.get(guild) || guild;
+        // The guild is the room, so the id the button carries is the room id.
+        const roomId = guild;
         const current = await currentSongForRoom(roomId, guild);
         if (!current) {
           await interaction.reply({ content: "📭 Nothing is playing", ephemeral: true });
@@ -1244,7 +1242,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       if (decoded.action === "p_skippl") {
         const guild = decoded.args[0];
         if (!guild) return;
-        const roomId = guildRoomMap.get(guild) || guild;
+        const roomId = guild;
         const current = await currentSongForRoom(roomId, guild);
         if (!current?.playlistId) {
           await interaction.reply({ content: "📭 Nothing is playing from a playlist", ephemeral: true });
@@ -1286,7 +1284,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       const guild = decoded.args[1];
       const requested = Number(decoded.args[0]);
       if (!guild) return;
-      const roomId = guildRoomMap.get(guild) || guild;
+      const roomId = guild;
       const queue = await loadQueue(roomId);
       // Clamp against the queue as it is now, not as it was when the panel was
       // rendered — songs get voted, removed, or played out while it sits idle.
@@ -1354,14 +1352,11 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.deferReply();
 
-      const roomId = guildRoomMap.get(guildId) || userCurrentRoom.get(interaction.user.id) || guildId;
-
-      guildRoomMap.set(guildId, roomId);
+      const roomId = guildId;
       await connectToVoiceChannel(guildId, voiceChannel.id);
       await playNextFromRoom(roomId, guildId);
 
-      const roomMsg = roomId !== guildId ? `room **${roomId}**` : "this server";
-      await interaction.editReply(`▶️ Starting queue from ${roomMsg}...`);
+      await interaction.editReply("▶️ Starting queue from this server...");
     }
 
     if (interaction.commandName === "stop") {
@@ -1378,7 +1373,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.commandName === "skip") {
       if (!guildId) return;
-      const roomId = guildRoomMap.get(guildId) || guildId;
+      const roomId = guildId;
 
       // Mirror the web skip gate (POST /api/rooms/:id/skip): the adder can
       // always skip, otherwise the song needs skipThreshold skip-votes from the
@@ -1407,7 +1402,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.commandName === "queue") {
       if (!guildId) return;
-      const roomId = guildRoomMap.get(guildId) || guildId;
+      const roomId = guildId;
       const queue = await loadQueue(roomId);
       // Public, not ephemeral: this panel is the shared queue everyone in the
       // channel votes and removes from.
@@ -1416,7 +1411,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.commandName === "lyrics") {
       if (!guildId) return;
-      const roomId = guildRoomMap.get(guildId) || guildId;
+      const roomId = guildId;
       const current = await currentSongForRoom(roomId, guildId);
       if (!current) {
         await interaction.reply({ content: "📭 Nothing is playing", ephemeral: true });
@@ -1441,28 +1436,24 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: "🚫 You need **Manage Server** permission to reset the queue.", ephemeral: true });
         return;
       }
-      const roomId = guildRoomMap.get(guildId) || guildId;
+      const roomId = guildId;
 
       await db.update(songs).set({ played: false }).where(eq(songs.roomId, roomId)).run();
       await interaction.reply("🔄 Queue reset — all songs are now playable");
     }
 
-    // Report which room this guild's playback is fed from (the guildRoomMap
-    // entry), so people in the server can see and join the same room in the
-    // browser. Falls back to the guild's own id when nothing has been bound
-    // yet — but only after /play or /listen sets the map, so a missing entry
-    // means the bot has never been started here.
+    // The guild is the room, so there is no bound room id to resolve. The row
+    // only exists once /play or /listen has started something here.
     if (interaction.commandName === "room") {
       if (!guildId) return;
-      const roomId = guildRoomMap.get(guildId);
-      if (!roomId) {
-        await interaction.reply("📭 No room bound to this server yet. Use `/play` or `/listen` to start.");
+      const roomId = guildId;
+      const room = await db.select().from(rooms).where(eq(rooms.id, roomId)).get();
+      if (!room) {
+        await interaction.reply("📭 Nothing started here yet — use `/play` or `/listen` to start a queue.");
         return;
       }
 
-      const room = await db.select().from(rooms).where(eq(rooms.id, roomId)).get();
       const connected = connections.has(guildId);
-      const isDefault = roomId === guildId;
 
       const counts = await db
         .select({
@@ -1476,7 +1467,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       const pending = Number(counts?.pending ?? 0);
 
       let ownerLine: string | null = null;
-      if (room?.createdBy) {
+      if (room.createdBy) {
         const owner = await db
           .select({ username: users.username })
           .from(users)
@@ -1496,11 +1487,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         nowLine = `• Now playing: **${cur?.title || cur?.videoId || `#${track.songId}`}**`;
       }
 
-      const header = isDefault
-        ? "🎵 This server is playing from its **default queue**"
-        : `🎵 This server is playing from room **${roomId}**`;
       const lines = [
-        header,
         `• Room ID: \`${roomId}\``,
         ownerLine,
         `• Bot: ${connected ? "🔊 Connected" : "💤 Not connected"}`,
@@ -1536,11 +1523,10 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 });
 
 // --- Periodic maintenance ---
-// Reap rooms that hold no songs, have nobody present, and have been idle past
-// the TTL. Auto-created rooms (a visit upserts the row) would otherwise pile up.
+// Reap rooms that hold no songs and have been idle past the TTL. Auto-created
+// rooms (a visit upserts the row) would otherwise pile up.
 async function gcEmptyRooms() {
   const cutoff = nowSeconds() - Math.floor(ROOM_TTL_MS / 1000);
-  const present = new Set(userCurrentRoom.values());
   const allRooms = await db.select().from(rooms).all();
 
   // Which rooms hold songs? One query instead of one-per-room.
@@ -1552,9 +1538,7 @@ async function gcEmptyRooms() {
 
   const stale = allRooms.filter((room) => {
     const lastActivity = room.lastActivityAt ?? room.createdAt ?? 0;
-    return (
-      lastActivity <= cutoff && !present.has(room.id) && !nonEmpty.has(room.id)
-    );
+    return lastActivity <= cutoff && !nonEmpty.has(room.id);
   });
 
   for (const room of stale) {
@@ -1584,6 +1568,28 @@ async function purgePlayedSongs() {
   console.log(`🧹 GC: purged ${ids.length} old played song(s)`);
 }
 
+// Rooms created by the removed browser flow are keyed by a random nanoid, so
+// nothing reaches them any more — playback, the queue UI, and gcEmptyRooms all
+// address a room by its guild id. Drop their songs, votes, and rows once; on
+// later boots the filter matches nothing.
+async function purgeUnreachableRooms() {
+  const roomIds = (
+    await db.selectDistinct({ id: rooms.id }).from(rooms).all()
+  ).map((r) => r.id);
+  const orphaned = roomIds.filter((id) => !discord.guilds.cache.has(id));
+  if (orphaned.length === 0) return;
+  const songIds = (
+    await db.select({ id: songs.id }).from(songs).where(inArray(songs.roomId, orphaned)).all()
+  ).map((s) => s.id);
+  await db.transaction(async (tx) => {
+    await tx.delete(votes).where(inArray(votes.songId, songIds));
+    await tx.delete(skipVotes).where(inArray(skipVotes.songId, songIds));
+    await tx.delete(songs).where(inArray(songs.id, songIds));
+    await tx.delete(rooms).where(inArray(rooms.id, orphaned));
+  });
+  console.log(`🧹 GC: purged ${orphaned.length} unreachable room(s) left by the removed browser flow`);
+}
+
 async function runMaintenance() {
   try { await gcEmptyRooms(); } catch (e) { console.error("gcEmptyRooms failed:", e); }
   try { await purgePlayedSongs(); } catch (e) { console.error("purgePlayedSongs failed:", e); }
@@ -1610,35 +1616,30 @@ function isAloneInVoice(guildId: string): boolean {
   return true;
 }
 
-// Discord listeners in the bot's voice channel don't register web presence
-// (userCurrentRoom is only populated via the browser), so without this the
-// skip threshold would ignore them and a minority web vote could skip a song
-// many people are listening to in voice. Counts non-bot members in the bot's
-// channel across every guild bound to the room.
+// Listeners per guild: the non-bot members in the bot's joined voice channel.
+// Presence is voice-only now, and a guild has an entry in `connections`
+// exactly when the bot is in one of its voice channels. The bot's own member
+// is excluded so the skip threshold counts listeners, not itself.
 function voicePresenceByRoom(): Map<string, number> {
   const map = new Map<string, number>();
   const botId = discord.user?.id;
-  for (const [guildId, roomId] of guildRoomMap) {
-    const conn = connections.get(guildId);
-    if (!conn) continue;
+  for (const [guildId, conn] of connections) {
     const channelId = conn.joinConfig.channelId;
     if (!channelId) continue;
     const guild = discord.guilds.cache.get(guildId);
     if (!guild) continue;
     for (const vs of guild.voiceStates.cache.values()) {
       if (vs.channelId === channelId && vs.id !== botId) {
-        map.set(roomId, (map.get(roomId) ?? 0) + 1);
+        map.set(guildId, (map.get(guildId) ?? 0) + 1);
       }
     }
   }
   return map;
 }
 
-// Total listeners in a room: web presence + Discord voice presence.
+// Present listeners in a room: the voice count for that guild.
 function roomPresence(roomId: string): number {
-  const web = [...userCurrentRoom.values()].filter((r) => r === roomId).length;
-  const voice = voicePresenceByRoom().get(roomId) ?? 0;
-  return web + voice;
+  return voicePresenceByRoom().get(roomId) ?? 0;
 }
 
 async function hasUnplayedSongs(roomId: string): Promise<boolean> {
@@ -1653,7 +1654,7 @@ async function hasUnplayedSongs(roomId: string): Promise<boolean> {
 async function reapIdleVoiceConnections() {
   const now = Date.now();
   for (const guildId of [...connections.keys()]) {
-    const roomId = guildRoomMap.get(guildId);
+    const roomId = guildId;
 
     // Alone in the voice channel — leave quickly.
     if (isAloneInVoice(guildId)) {
@@ -1670,7 +1671,7 @@ async function reapIdleVoiceConnections() {
     }
 
     // Empty queue (and nothing currently playing) — leave after the grace period.
-    if (!currentTracks.has(guildId) && roomId) {
+    if (!currentTracks.has(guildId)) {
       if (!(await hasUnplayedSongs(roomId))) {
         if (!emptySince.has(guildId)) emptySince.set(guildId, now);
         if (now - emptySince.get(guildId)! >= EMPTY_QUEUE_LEAVE_MS) {
