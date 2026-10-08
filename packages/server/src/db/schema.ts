@@ -5,8 +5,6 @@ export const users = sqliteTable("users", {
   id: text("id").primaryKey(), // Discord user ID
   username: text("username").notNull(),
   avatar: text("avatar"),
-  // Bumped on logout to invalidate all previously-issued JWTs for this user.
-  tokenVersion: integer("token_version").notNull().default(0),
   createdAt: integer("created_at").$defaultFn(() => Math.floor(Date.now() / 1000)),
 });
 

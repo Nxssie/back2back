@@ -71,6 +71,13 @@
       "when": 1783202679939,
       "tag": "0009_windy_speed",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1791446248885,
+      "tag": "0010_powerful_blob",
+      "breakpoints": true
     }
   ]
 }
