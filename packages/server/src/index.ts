@@ -46,6 +46,7 @@ import { YTDLP_BASE_ARGS, YTDLP_DOWNLOAD_ARGS } from "./lib/ytdlp";
 import { searchTracks, toSelectOptions, type SearchableSource } from "./lib/search";
 import { encodeId, decodeId } from "./lib/components";
 import { formatQueuePage, clampPage, slicePage, type QueueSong } from "./lib/queue";
+import { fetchLyrics, formatLyrics } from "./lib/lyrics";
 import path from "node:path";
 
 // --- Config ---
@@ -1827,6 +1828,50 @@ function queuePanel(queue: QueueSong[], page: number, guildId: string, userId: s
   return { embeds: [new EmbedBuilder().setDescription(view.text)], components };
 }
 
+// Moderation overview for /admin. Every render reads the DB fresh so an action
+// never shows a list the database no longer has.
+async function adminView() {
+  const pending = await db
+    .select()
+    .from(guilds)
+    .where(eq(guilds.approved, false))
+    .orderBy(desc(guilds.requestedAt))
+    .all();
+  const roomCount = (await db.select({ c: sql<number>`count(*)` }).from(rooms).get())?.c ?? 0;
+  const songCount = (await db.select({ c: sql<number>`count(*)` }).from(songs).get())?.c ?? 0;
+
+  // Discord caps a select at 25 options, so the list is capped to match.
+  const options = pending.slice(0, 25).map((g) => ({
+    label: (g.name?.trim() || g.id).slice(0, 100),
+    value: g.id,
+  }));
+
+  const lines = [
+    `• Rooms: **${roomCount}**`,
+    `• Songs: **${songCount}**`,
+    `• Active voice connections: **${connections.size}**`,
+    "",
+    pending.length === 0
+      ? "✅ No servers pending approval."
+      : `**Pending servers (${pending.length})**\n${options.map((o) => `• ${o.label} \`${o.value}\``).join("\n")}`,
+  ];
+
+  // Discord rejects a select with zero options, so pending guilds add the rows.
+  const components: ActionRowBuilder<StringSelectMenuBuilder>[] = [];
+  if (options.length > 0) {
+    components.push(
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder().setCustomId(encodeId("a_approve")).setPlaceholder("Approve a server").addOptions(options)
+      ),
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder().setCustomId(encodeId("a_reject")).setPlaceholder("Reject a server").addOptions(options)
+      )
+    );
+  }
+
+  return { embeds: [new EmbedBuilder().setDescription(lines.join("\n"))], components };
+}
+
 discord.on(Events.InteractionCreate, async (interaction) => {
   if (
     !interaction.isChatInputCommand() &&
@@ -1839,7 +1884,9 @@ discord.on(Events.InteractionCreate, async (interaction) => {
   if (guildId) guildTextChannel.set(guildId, interaction.channelId);
 
   // Gate on guild approval: pending or unknown guilds can't use bot commands.
-  if (guildId) {
+  // Admins are exempt because the web panel that approved guilds is going away
+  // and /admin must be reachable inside a pending guild to bootstrap it.
+  if (guildId && !ADMIN_DISCORD_IDS.has(interaction.user.id)) {
     const guildRecord = await db.select().from(guilds).where(eq(guilds.id, guildId)).get();
     if (!guildRecord || !guildRecord.approved) {
       await interaction.reply({ content: "⏳ This server is pending admin approval.", ephemeral: true });
@@ -1861,6 +1908,42 @@ discord.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
         await queueTrackForGuild(interaction, guildId, url, source);
+      }
+
+      // /admin approve/reject selects. Reproduces the two HTTP admin routes
+      // (POST /api/admin/guilds/:guildId/approve|reject) exactly, including the
+      // fields they set and the kick on reject.
+      if (decoded?.action === "a_approve" || decoded?.action === "a_reject") {
+        if (!ADMIN_DISCORD_IDS.has(interaction.user.id)) {
+          await interaction.reply({ content: "🚫 Not authorized.", ephemeral: true });
+          return;
+        }
+        const target = interaction.values[0];
+        if (!target) return;
+
+        if (decoded.action === "a_approve") {
+          await db
+            .update(guilds)
+            .set({ approved: true, approvedAt: nowSeconds() })
+            .where(eq(guilds.id, target))
+            .run();
+          console.log(`✅ Guild ${target} approved by ${interaction.user.username}`);
+        } else {
+          await db.delete(guilds).where(eq(guilds.id, target)).run();
+          teardownGuild(target);
+          const guild = discord.guilds.cache.get(target);
+          if (guild) {
+            try { await guild.leave(); } catch (e) { console.error(`Failed to leave guild ${target}:`, e); }
+          }
+          console.log(`❌ Guild ${target} rejected by ${interaction.user.username}`);
+        }
+
+        await interaction.update(await adminView());
+        await interaction.followUp({
+          content: decoded.action === "a_approve" ? `✅ Approved **${target}**.` : `❌ Rejected **${target}**.`,
+          ephemeral: true,
+        });
+        return;
       }
 
       // Queue panel selects. The page rides in the customId so the re-render
@@ -2111,6 +2194,26 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       await interaction.reply(queuePanel(queue, 1, guildId, interaction.user.id));
     }
 
+    if (interaction.commandName === "lyrics") {
+      if (!guildId) return;
+      const roomId = guildRoomMap.get(guildId) || guildId;
+      const current = await currentSongForRoom(roomId, guildId);
+      if (!current) {
+        await interaction.reply({ content: "📭 Nothing is playing", ephemeral: true });
+        return;
+      }
+      const found = await fetchLyrics(current.title || current.videoId, current.uploader);
+      const text = found ? formatLyrics(found) : null;
+      if (!text) {
+        await interaction.reply({
+          content: `❌ No lyrics found for **${current.title || current.videoId}**.`,
+          ephemeral: true,
+        });
+        return;
+      }
+      await interaction.reply({ content: text, ephemeral: true });
+    }
+
     if (interaction.commandName === "reset") {
       if (!guildId) return;
       // Resetting the whole queue is a room-wide action — gate to moderators.
@@ -2187,6 +2290,20 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       ].filter(Boolean);
 
       await interaction.reply(lines.join("\n"));
+    }
+
+    if (interaction.commandName === "admin") {
+      if (!ADMIN_DISCORD_IDS.has(interaction.user.id)) {
+        await interaction.reply({ content: "🚫 Not authorized.", ephemeral: true });
+        return;
+      }
+      await interaction.reply({ ...(await adminView()), ephemeral: true });
+    }
+
+    if (interaction.commandName === "help") {
+      // Built from the registered set, so it can never drift from /commands.
+      const lines = commands.map((c) => `• \`/${c.name}\` — ${c.description}`);
+      await interaction.reply({ content: `**Commands**\n${lines.join("\n")}`, ephemeral: true });
     }
   } catch (err) {
     const label = interaction.isChatInputCommand() ? `'${interaction.commandName}'` : `component '${interaction.customId}'`;

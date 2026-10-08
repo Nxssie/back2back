@@ -39,9 +39,18 @@ export const commands = [
     .setName("queue")
     .setDescription("Show the current queue"),
   new SlashCommandBuilder()
+    .setName("lyrics")
+    .setDescription("Show the lyrics of the current track"),
+  new SlashCommandBuilder()
     .setName("reset")
     .setDescription("Reset all songs to be playable again"),
   new SlashCommandBuilder()
     .setName("room")
     .setDescription("Show which room this server is currently playing from"),
+  new SlashCommandBuilder()
+    .setName("admin")
+    .setDescription("Approve or reject servers waiting for access"),
+  new SlashCommandBuilder()
+    .setName("help")
+    .setDescription("List the available commands"),
 ].map((command) => command.toJSON());
