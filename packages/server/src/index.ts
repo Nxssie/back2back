@@ -19,6 +19,7 @@ import {
   EmbedBuilder,
   type ChatInputCommandInteraction,
   type StringSelectMenuInteraction,
+  type TextChannel,
   type VoiceBasedChannel,
 } from "discord.js";
 import {
@@ -34,7 +35,7 @@ import {
   type VoiceConnection,
 } from "@discordjs/voice";
 import { db } from "./db";
-import { users, rooms, songs, votes, skipVotes, guilds, type User } from "./db/schema";
+import { users, rooms, songs, votes, skipVotes, guilds, type User, type Song } from "./db/schema";
 import { eq, desc, and, inArray, lt, sql } from "drizzle-orm";
 import { commands } from "./commands";
 import { extractVideoId, isPlaylistUrl } from "./lib/youtube";
@@ -116,6 +117,11 @@ function isAdmin(user: User | null): boolean {
 const players = new Map<string, AudioPlayer>();
 const connections = new Map<string, VoiceConnection>();
 const guildRoomMap = new Map<string, string>();
+// Where each guild's now-playing card lives. Discord gives no text channel for
+// a voice channel, so the channel is remembered from whichever channel a
+// command was used in, and the card is edited in place from track to track.
+const guildTextChannel = new Map<string, string>();
+const nowPlayingMessage = new Map<string, { channelId: string; messageId: string }>();
 const currentTracks = new Map<
   string,
   { songId: number; videoId: string; startedAt: number; cleanup: () => void }
@@ -585,6 +591,92 @@ async function playNextFromRoom(roomId: string, guildId: string) {
   }
 }
 
+// The song actually streaming, else the vote-order pick when nothing is
+// streaming (bot not connected) — the same anchor both skip routes use, so a
+// pending song that overtook the playing one in votes cannot be marked played
+// while the real track keeps streaming.
+async function currentSongForRoom(roomId: string, guildId: string): Promise<Song | null> {
+  const track = currentTracks.get(guildId);
+  if (track) {
+    return (await db.select().from(songs).where(eq(songs.id, track.songId)).get()) ?? null;
+  }
+  return (
+    (await db
+      .select()
+      .from(songs)
+      .where(and(eq(songs.roomId, roomId), eq(songs.played, false)))
+      .orderBy(desc(songs.votes), songs.createdAt)
+      .get()) ?? null
+  );
+}
+
+async function skipVoteCount(songId: number): Promise<number> {
+  return (
+    await db.select({ c: sql<number>`count(*)` }).from(skipVotes).where(eq(skipVotes.songId, songId)).get()
+  )?.c ?? 0;
+}
+
+// Mark played before stopping the player, the order both skip routes use, so
+// the DB is already consistent when the Idle handler tries to mark it again.
+async function markSkipped(guildId: string, songId: number): Promise<void> {
+  await db.update(songs).set({ played: true }).where(eq(songs.id, songId)).run();
+  await db.delete(skipVotes).where(eq(skipVotes.songId, songId)).run();
+  recentSkip.add(guildId);
+  players.get(guildId)?.stop();
+}
+
+function nowPlayingEmbed(song: Song): EmbedBuilder {
+  const embed = new EmbedBuilder()
+    .setTitle(song.title?.trim() || song.videoId)
+    .setURL(song.url)
+    .setFooter({ text: song.addedBy ? `Added by ${song.addedBy}` : "Now playing" });
+  const thumbnail =
+    song.thumbnail ??
+    (song.source === "youtube" ? `https://i.ytimg.com/vi/${song.videoId}/hqdefault.jpg` : null);
+  return thumbnail ? embed.setThumbnail(thumbnail) : embed;
+}
+
+// The card follows the track: edit the previous one when it still exists,
+// otherwise post a new one. No Discord failure here may disturb playback, which
+// is already streaming by the time this runs.
+async function publishNowPlaying(guildId: string, song: Song): Promise<void> {
+  const channelId = guildTextChannel.get(guildId);
+  if (!channelId) return;
+  try {
+    const channel = await discord.channels.fetch(channelId);
+    if (!channel?.isTextBased()) return;
+    const payload = {
+      embeds: [nowPlayingEmbed(song)],
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId(encodeId("p_skipvote", guildId))
+            .setLabel("Vote skip")
+            .setEmoji("🗳️")
+            .setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder()
+            .setCustomId(encodeId("p_skip", guildId))
+            .setLabel("Skip")
+            .setEmoji("⏭️")
+            .setStyle(ButtonStyle.Secondary)
+        ),
+      ],
+    };
+    const previous = nowPlayingMessage.get(guildId);
+    if (previous?.channelId === channelId) {
+      const message = await channel.messages.fetch(previous.messageId).catch(() => null);
+      if (message) {
+        await message.edit(payload);
+        return;
+      }
+    }
+    const sent = await (channel as TextChannel).send(payload);
+    nowPlayingMessage.set(guildId, { channelId, messageId: sent.id });
+  } catch (err) {
+    console.error(`⚠️ Could not publish the now-playing card for guild ${guildId}:`, err);
+  }
+}
+
 async function playNextFromRoomInner(roomId: string, guildId: string) {
   // Don't clobber a track that's already streaming. The current song stays
   // `played = false` until it finishes, so without this guard we'd re-pick it
@@ -674,6 +766,8 @@ async function playNextFromRoomInner(roomId: string, guildId: string) {
     startedAt: Date.now(),
     cleanup,
   });
+
+  await publishNowPlaying(guildId, nextSong);
 }
 
 // --- Hono API ---
@@ -1597,6 +1691,8 @@ discord.on(Events.GuildCreate, async (guild) => {
 discord.on(Events.GuildDelete, async (guild) => {
   await db.delete(guilds).where(eq(guilds.id, guild.id)).run();
   teardownGuild(guild.id);
+  guildTextChannel.delete(guild.id);
+  nowPlayingMessage.delete(guild.id);
   console.log(`🗑️ Guild "${guild.name}" (${guild.id}) removed`);
 });
 
@@ -1739,6 +1835,8 @@ discord.on(Events.InteractionCreate, async (interaction) => {
   )
     return;
   const { guildId } = interaction;
+  // The now-playing card is posted to the last channel a command was used in.
+  if (guildId) guildTextChannel.set(guildId, interaction.channelId);
 
   // Gate on guild approval: pending or unknown guilds can't use bot commands.
   if (guildId) {
@@ -1822,7 +1920,66 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.isButton()) {
       const decoded = decodeId(interaction.customId);
-      if (!decoded || !["q_prev", "q_refresh", "q_next"].includes(decoded.action)) return;
+      if (!decoded) return;
+
+      // Now-playing card buttons. They mirror the two HTTP skip routes rather
+      // than inventing a moderator bypass: vote-skip casts this user's vote and
+      // stops the track once the threshold is reached.
+      if (decoded.action === "p_skipvote" || decoded.action === "p_skip") {
+        const guild = decoded.args[0];
+        if (!guild) return;
+        const roomId = guildRoomMap.get(guild) || guild;
+        const current = await currentSongForRoom(roomId, guild);
+        if (!current) {
+          await interaction.reply({ content: "📭 Nothing is playing", ephemeral: true });
+          return;
+        }
+
+        const threshold = skipThreshold(roomPresence(roomId));
+        const isOwner = !!current.addedByUserId && current.addedByUserId === interaction.user.id;
+        const votes = await skipVoteCount(current.id);
+        const title = current.title || current.videoId;
+
+        if (isOwner) {
+          await markSkipped(guild, current.id);
+          await interaction.reply({ content: `⏭️ Skipped **${title}** — you added it.`, ephemeral: true });
+          return;
+        }
+
+        if (decoded.action === "p_skip") {
+          if (votes < threshold) {
+            await interaction.reply({
+              content: `🗳️ Not enough votes to skip **${title}** — ${votes}/${threshold}. The person who added it can skip anytime.`,
+              ephemeral: true,
+            });
+            return;
+          }
+          await markSkipped(guild, current.id);
+          await interaction.reply({ content: `⏭️ Skipped **${title}** — ${votes}/${threshold} votes.`, ephemeral: true });
+          return;
+        }
+
+        const existing = await db
+          .select()
+          .from(skipVotes)
+          .where(and(eq(skipVotes.songId, current.id), eq(skipVotes.userId, interaction.user.id)))
+          .get();
+        if (existing) {
+          await interaction.reply({ content: `🗳️ You already voted to skip **${title}** — ${votes}/${threshold}.`, ephemeral: true });
+          return;
+        }
+
+        await db.insert(skipVotes).values({ songId: current.id, userId: interaction.user.id }).run();
+        if (votes + 1 >= threshold) {
+          await markSkipped(guild, current.id);
+          await interaction.reply({ content: `⏭️ Skipped **${title}** — ${votes + 1}/${threshold} votes.`, ephemeral: true });
+          return;
+        }
+        await interaction.reply({ content: `🗳️ Vote to skip **${title}** registered — ${votes + 1}/${threshold}.`, ephemeral: true });
+        return;
+      }
+
+      if (!["q_prev", "q_refresh", "q_next"].includes(decoded.action)) return;
       const guild = decoded.args[1];
       const requested = Number(decoded.args[0]);
       if (!guild) return;
@@ -1921,19 +2078,10 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       const roomId = guildRoomMap.get(guildId) || guildId;
 
       // Mirror the web skip gate (POST /api/rooms/:id/skip): the adder can
-      // always skip, otherwise the song needs skipThreshold upvotes from the
-      // room's present listeners (web + Discord voice). Without this /skip
-      // was a one-click bypass of the vote system the web enforces.
-      const track = currentTracks.get(guildId);
-      const current = track
-        ? await db.select().from(songs).where(eq(songs.id, track.songId)).get()
-        : await db
-            .select()
-            .from(songs)
-            .where(and(eq(songs.roomId, roomId), eq(songs.played, false)))
-            .orderBy(desc(songs.votes), songs.createdAt)
-            .get();
-
+      // always skip, otherwise the song needs skipThreshold skip-votes from the
+      // room's present listeners. Without this /skip was a one-click bypass of
+      // the vote system the web enforces.
+      const current = await currentSongForRoom(roomId, guildId);
       if (!current) {
         await interaction.reply({ content: "📭 Nothing is playing", ephemeral: true });
         return;
@@ -1941,7 +2089,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 
       const threshold = skipThreshold(roomPresence(roomId));
       const isOwner = !!current.addedByUserId && current.addedByUserId === interaction.user.id;
-      const skipVotesCount = (await db.select({ c: sql<number>`count(*)` }).from(skipVotes).where(eq(skipVotes.songId, current.id)).get())?.c ?? 0;
+      const skipVotesCount = await skipVoteCount(current.id);
       if (!isOwner && skipVotesCount < threshold) {
         await interaction.reply({
           content: `🗳️ Not enough votes to skip **${current.title || current.videoId}** — ${skipVotesCount}/${threshold}. The person who added it can skip anytime.`,
@@ -1950,10 +2098,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      await db.update(songs).set({ played: true }).where(eq(songs.id, current.id)).run();
-      await db.delete(skipVotes).where(eq(skipVotes.songId, current.id)).run();
-      recentSkip.add(guildId);
-      players.get(guildId)?.stop();
+      await markSkipped(guildId, current.id);
       await interaction.reply("⏭️ Skipped");
     }
 
