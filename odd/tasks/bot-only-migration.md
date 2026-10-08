@@ -7,11 +7,11 @@ feature parity via slash commands and message components.
 
 | Field | Value |
 |---|---|
-| State | in progress — Slice A, 7 of 13 tasks done |
+| State | Slice A code complete — 12 of 13 tasks; A13 pending |
 | Branch | `feat/bot-only-migration` |
 | Slices | A (additive bot surface) → B (room semantics) → C (delete web + auth) |
 | Tasks | 20 |
-| Blocked on | Slice A13 needs a live Discord app to smoke-test; Slice C must not start before it passes |
+| Blocked on | A13 needs a live Discord app (see the smoke checklist below). Slice C must not start before it passes. |
 
 ## Decisions locked
 
@@ -71,17 +71,16 @@ testable modules. Nothing breaks if Slice A lands alone.
 - [x] **A6. `/search`** — deferReply(ephemeral) → select menu → queue the pick. `6cd1d83`
 - [x] **A7. `/queue` panel** — embed + pagination buttons + upvote select +
        remove-mine select, handled in `InteractionCreate` (no collectors). `8fd6204`
-- [ ] **A8. Now-playing message** — post/edit per track in the bound channel,
-       with skip-vote / skip / force-skip buttons.
-- [ ] **A9. `/lyrics`** — ephemeral plain text for the current track.
-- [ ] **A10. `/admin`** — pending-guild list with approve/reject buttons, room
-       and voice counts. **Exempt `ADMIN_DISCORD_IDS` from the approval gate**
-       (index.ts:1679) so a new guild can be bootstrapped.
-- [ ] **A11. `/help`** — ephemeral command index.
-- [ ] **A12. Register all new commands** in `commands.ts` + `deploy-commands.ts`.
-       (`deploy-commands.ts` consumes the exported array, so only `commands.ts` changes.)
-- [ ] **A13. Smoke pass** — verify A6–A11 against live Discord with the web still
-       running, so both UIs can be compared. **Requires a live bot; blocked on the user.**
+- [x] **A8. Now-playing message** — post/edit per track in the bound channel,
+       with skip-vote / skip buttons (see Deviations). `e2291f4`
+- [x] **A9. `/lyrics`** — ephemeral plain text for the current track. `a07f6b4`
+- [x] **A10. `/admin`** — pending-guild list with approve/reject selects, room,
+       song and voice counts. Admins exempted from the approval gate. `a07f6b4`
+- [x] **A11. `/help`** — ephemeral command index derived from the registered set. `a07f6b4`
+- [x] **A12. Register all new commands** in `commands.ts`.
+       (`deploy-commands.ts` consumes the exported array, so only `commands.ts` changes.) `a07f6b4`
+- [ ] **A13. Smoke pass** — the checklist below, against live Discord with the web
+       still running so both UIs can be compared. **Requires a live bot; blocked on the user.**
 
 ### Slice B — room semantics = guild
 
@@ -164,6 +163,41 @@ This also materially supports the premise of the migration. If `/queue` was
 dead, the web was the only working way to see a queue, which is consistent with
 users settling on the SPA for everything except `/play`, `/skip`, and `/stop`.
 
+## Deviations from this plan
+
+1. **A8 shipped two skip buttons, not three.** The plan listed
+   skip-vote / skip / force-skip. A moderator force-skip would be a *new*
+   privilege that neither HTTP route grants, and the plan's own non-goal is
+   parity only. The card therefore mirrors the two existing routes: *Vote skip*
+   (casts this user's vote; the adder skips outright) and *Skip* (the same gate
+   `/skip` enforces).
+2. **A5 keeps a duplicate lyrics module.** `packages/web/src/lib/lyrics.ts`
+   still exists because the SPA has to keep building until C1 deletes it. There
+   is no second consumer to keep in sync after that.
+
+## Slice A smoke checklist (A13)
+
+Needs a live Discord app, yt-dlp on `PATH`, and at least one guild. Run with
+`bun run dev:server`. Every line below is code that has **never been executed**.
+
+| # | Step | Expected |
+|---|---|---|
+| 1 | `/help` in an approved guild | Ephemeral list of every registered command |
+| 2 | `/search query:coldplay` | Ephemeral "results for" prompt within ~10s, with a select |
+| 3 | Pick a result from that select | Select clears, track queues, ephemeral confirmation |
+| 4 | `/queue` | Public embed, page 1/N, upvote and remove selects |
+| 5 | `Next ▶` on a 25+ song queue, then `Refresh` | Page advances and clamps at the last page |
+| 6 | Upvote via the queue select | Count rises, ephemeral confirmation; press again → "already upvoted" |
+| 7 | Remove one of your own songs | Disappears; another user's song is refused |
+| 8 | Let a track start | Now-playing card appears in the channel the command came from |
+| 9 | *Vote skip* as a non-adder | Vote registered with n/threshold; card advances when reached |
+| 10 | *Vote skip* as the adder, and `/skip` as a non-adder with no votes | Immediate skip, and the refusal message respectively |
+| 11 | `/lyrics` on a track | Ephemeral lyrics, or a clear not-found |
+| 12 | Restart the bot, then press an old now-playing or queue button | Still works (stateless component ids) |
+| 13 | `/admin` as a non-admin | Refusal |
+| 14 | In a **pending** guild: `/play` as a non-admin, then `/admin` as an admin | Refusal, then the overview with an approve select |
+| 15 | Approve that guild via the select, then `/queue` there | Works (this is the deadlock fix) |
+
 ## Open questions
 
 1. Slice B4: migrate existing room rows to guild ids, or let GC drop them?
@@ -181,6 +215,9 @@ users settling on the SPA for everything except `/play`, `/skip`, and `/stop`.
 | `c86639a` | A5 | `lib/lyrics.ts` + 6 tests. RED: module missing, then GREEN. Full suite 68 pass. |
 | `6cd1d83` | A6 | `/search` + `search_pick` handler; `queueTrackForGuild()` extracted from `/play` (index.ts:1603). Full suite 68 pass. **Live interaction path unverified.** |
 | `8fd6204` | A7 | `/queue` panel; `loadQueue()` (index.ts:1657) and `queuePanel()` (index.ts:1669). Full suite 68 pass. **Live interaction path unverified.** |
+| `bc89ff3` | A2, A7 | Corrected the `/queue` defect: `.all()` returns a Promise under `drizzle-orm/libsql`, so `.filter` on it threw on every invocation — the command never worked, at any queue length. Proven empirically. |
+| `e2291f4` | A8 | Now-playing card + `p_skipvote`/`p_skip` buttons; helpers `currentSongForRoom()` (index.ts:598), `skipVoteCount()` (613), `markSkipped()` (621), `publishNowPlaying()` (642). Full suite 68 pass. **Live path unverified.** |
+| `a07f6b4` | A9–A12 | `/lyrics`, `/admin`, `/help`; `adminView()` (index.ts:1833); gate now `if (guildId && !ADMIN_DISCORD_IDS.has(interaction.user.id))` (index.ts:1889). Full suite 68 pass. **Live path unverified.** |
 
 ### Verification gap
 
