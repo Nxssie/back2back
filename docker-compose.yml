@@ -3,9 +3,11 @@ services:
     build:
       context: .
       dockerfile: packages/server/Dockerfile
-    # Internal only — Coolify's Traefex reverse-proxies to this port.
+    # Internal only — Coolify's Traefik reverse-proxies to this port.
     # Set the service's domain (https://b2b.nxssie.dev) in the Coolify UI;
     # no published host port needed, no Traefik labels.
+    # NOTE: Traefik forwards every path, so /metrics is reachable from the
+    # public domain. It fails closed without METRICS_TOKEN.
     expose:
       - "3001"
     volumes:
@@ -16,15 +18,10 @@ services:
       - NODE_ENV=production
       # SQLite file inside the mounted volume so data survives redeploys.
       - DATABASE_URL=file:/app/data/data.db
-      - DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID}
-      - DISCORD_CLIENT_SECRET=${DISCORD_CLIENT_SECRET}
-      - DISCORD_REDIRECT_URI=${DISCORD_REDIRECT_URI}
-      # Public origin for post-login redirects, e.g. https://b2b.nxssie.dev
-      - FRONTEND_URL=${FRONTEND_URL}
       - DISCORD_TOKEN=${DISCORD_TOKEN}
-      # Required in prod: the server refuses to boot without a strong secret.
-      - JWT_SECRET=${JWT_SECRET}
       - ADMIN_DISCORD_IDS=${ADMIN_DISCORD_IDS:-}
+      # Unset disables /metrics rather than serving it unauthenticated.
+      - METRICS_TOKEN=${METRICS_TOKEN:-}
       - ROOM_TTL_HOURS=${ROOM_TTL_HOURS:-24}
     restart: unless-stopped
     mem_limit: 768m

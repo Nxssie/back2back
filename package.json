@@ -7,7 +7,6 @@
   "scripts": {
     "dev": "bun --filter './packages/*' dev",
     "dev:server": "bun --filter server dev",
-    "dev:web": "bun --filter web dev",
     "build": "bun --filter './packages/*' build",
     "db:generate": "bun --filter server db:generate",
     "db:push": "bun --filter server db:push",

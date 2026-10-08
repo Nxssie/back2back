@@ -1,7 +1,4 @@
 import { Hono } from "hono";
-import { cors } from "hono/cors";
-import { logger } from "hono/logger";
-import { getCookie, setCookie } from "hono/cookie";
 import { serve } from "bun";
 import { spawn } from "child_process";
 import ffmpegStatic from "ffmpeg-static";
@@ -12,6 +9,14 @@ import {
   REST,
   Routes,
   PermissionsBitField,
+  ActionRowBuilder,
+  StringSelectMenuBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
+  type ChatInputCommandInteraction,
+  type StringSelectMenuInteraction,
+  type TextChannel,
   type VoiceBasedChannel,
 } from "discord.js";
 import {
@@ -27,51 +32,26 @@ import {
   type VoiceConnection,
 } from "@discordjs/voice";
 import { db } from "./db";
-import { users, rooms, songs, votes, skipVotes, guilds, type User } from "./db/schema";
+import { users, rooms, songs, votes, skipVotes, guilds, type Song } from "./db/schema";
 import { eq, desc, and, inArray, lt, sql } from "drizzle-orm";
 import { commands } from "./commands";
 import { extractVideoId, isPlaylistUrl } from "./lib/youtube";
 import { detectSource, isSoundcloudSetUrl, type Source } from "./lib/sources";
-import { encodeJwt, decodeJwt } from "./lib/jwt";
 import { skipThreshold } from "./lib/voting";
-import path from "node:path";
+import { YTDLP_BASE_ARGS, YTDLP_DOWNLOAD_ARGS } from "./lib/ytdlp";
+import { searchTracks, toSelectOptions, type SearchableSource } from "./lib/search";
+import { encodeId, decodeId } from "./lib/components";
+import { formatQueuePage, clampPage, slicePage, type QueueSong } from "./lib/queue";
+import { fetchLyrics, formatLyrics } from "./lib/lyrics";
 
 // --- Config ---
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
-const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
-const DISCORD_REDIRECT_URI =
-  process.env.DISCORD_REDIRECT_URI || "http://localhost:3001/auth/discord/callback";
-// Where to send the browser after the OAuth flow. Defaults to the Vite dev
-// server; in prod set FRONTEND_URL to the public origin (no trailing slash).
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
-const IS_PROD = process.env.NODE_ENV === "production";
-const IS_DEV = process.env.NODE_ENV === "development";
-const WEB_DIST_DIR = path.join(import.meta.dirname, "../../web/dist");
-const INDEX_HTML = path.join(WEB_DIST_DIR, "index.html");
 const PORT = Number(process.env.PORT) || 3001;
-const DEFAULT_JWT_SECRET = "back2back-secret-change-in-production";
-const JWT_SECRET = process.env.JWT_SECRET || DEFAULT_JWT_SECRET;
-const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
-
-// Fail fast anywhere but explicit development rather than signing tokens with
-// the known default secret — anyone aware of it could forge a token for any
-// user id (including an admin) and delete every room.
-if (!IS_DEV && (JWT_SECRET === DEFAULT_JWT_SECRET || JWT_SECRET.length < 32)) {
-  throw new Error(
-    "JWT_SECRET must be set to a strong (>= 32 char) secret outside development"
-  );
-}
-
-// Allowed browser origins for cross-origin requests (defense in depth; in prod
-// everything is same-origin behind nginx). Same-origin requests (no Origin
-// header) always pass; localhost/LAN is only allowed outside production.
-const CORS_ALLOWED_ORIGINS = new Set(
-  (process.env.CORS_ALLOWED_ORIGINS || FRONTEND_URL)
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-);
+// Bearer token gating the /metrics scrape endpoint. When unset the route is
+// disabled entirely, so a missing secret fails closed instead of exposing
+// operational counters.
+const METRICS_TOKEN = process.env.METRICS_TOKEN;
 
 // Global moderators — comma-separated Discord user IDs in the env. These users
 // can delete any room. Kept as config (not a DB role) so granting admin is a
@@ -97,29 +77,14 @@ const EMPTY_QUEUE_LEAVE_MS =
 // Leave a voice channel once the bot has been the only one in it for this long.
 const ALONE_LEAVE_MS = 60 * 1000;
 
-function isAdmin(user: User | null): boolean {
-  return !!user && ADMIN_DISCORD_IDS.has(user.id);
-}
-
-// Optional yt-dlp hardening for servers whose IP YouTube rate-limits/blocks
-// (datacenter IPs frequently hit "Sign in to confirm you're not a bot" / 403,
-// which makes tracks fail to extract and end almost instantly). Set these in the
-// environment — no code change needed — to recover playback:
-//   YTDLP_COOKIES=/app/data/cookies.txt          Netscape cookie jar from a logged-in session
-//   YTDLP_EXTRACTOR_ARGS=youtube:player_client=default,mweb
-//   YTDLP_DOWNLOADER=ffmpeg                        more robust for fragmented/SABR streams
-const YTDLP_BASE_ARGS: string[] = [
-  ...(process.env.YTDLP_COOKIES ? ["--cookies", process.env.YTDLP_COOKIES] : []),
-  ...(process.env.YTDLP_EXTRACTOR_ARGS ? ["--extractor-args", process.env.YTDLP_EXTRACTOR_ARGS] : []),
-];
-const YTDLP_DOWNLOAD_ARGS: string[] = process.env.YTDLP_DOWNLOADER
-  ? ["--downloader", process.env.YTDLP_DOWNLOADER]
-  : [];
-
 // --- State (in-memory; this is a deliberately single-instance service) ---
 const players = new Map<string, AudioPlayer>();
 const connections = new Map<string, VoiceConnection>();
-const guildRoomMap = new Map<string, string>();
+// Where each guild's now-playing card lives. Discord gives no text channel for
+// a voice channel, so the channel is remembered from whichever channel a
+// command was used in, and the card is edited in place from track to track.
+const guildTextChannel = new Map<string, string>();
+const nowPlayingMessage = new Map<string, { channelId: string; messageId: string }>();
 const currentTracks = new Map<
   string,
   { songId: number; videoId: string; startedAt: number; cleanup: () => void }
@@ -161,24 +126,6 @@ const discord = new Client({
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 
-// --- Auth ---
-async function getUser(c: any): Promise<User | null> {
-  const token = getCookie(c, "b2b_token");
-  if (!token) return null;
-  const payload = await decodeJwt(token, JWT_SECRET);
-  if (!payload?.sub) return null;
-  const user = await db
-    .select()
-    .from(users)
-    .where(eq(users.id, payload.sub as string))
-    .get();
-  if (!user) return null;
-  // Reject tokens whose version is behind the user's current one (revoked on
-  // logout).
-  if ((payload.tv ?? 0) !== (user.tokenVersion ?? 0)) return null;
-  return user;
-}
-
 // Ensure a room row exists. Ownership (createdBy) is set exactly once — at
 // creation, to the user performing the creating write — and is NEVER claimed
 // later. The atomic upsert only bumps the activity timestamp on an existing
@@ -193,27 +140,6 @@ async function ensureRoom(id: string, userId?: string | null) {
       set: { lastActivityAt: nowSeconds() },
     });
   return db.select().from(rooms).where(eq(rooms.id, id)).get();
-}
-
-// --- Simple in-memory rate limiter (fixed window per ip+key) ---
-const rateBuckets = new Map<string, { count: number; resetAt: number }>();
-function rateLimit(key: string, limit: number, windowMs: number): boolean {
-  const now = Date.now();
-  const bucket = rateBuckets.get(key);
-  if (!bucket || now > bucket.resetAt) {
-    rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
-    return true;
-  }
-  if (bucket.count >= limit) return false;
-  bucket.count++;
-  return true;
-}
-function clientKey(c: any): string {
-  return (
-    c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
-    c.req.header("x-real-ip") ||
-    "local"
-  );
 }
 
 // --- yt-dlp + ffmpeg audio stream ---
@@ -453,6 +379,45 @@ async function resolveSingleTrack(
   return resolveSoundcloudTrack(url);
 }
 
+// `source` picks how each flat-playlist entry's url is built: YouTube entries
+// reliably carry only an id, so the canonical watch url is reconstructed;
+// SoundCloud flat-playlist entries carry their own (sometimes internal API,
+// not the public webpage) url and never a title — titles for those are filled
+// in lazily by playNextFromRoomInner, same as any song missing a title.
+async function resolvePlaylist(
+  url: string,
+  source: Source
+): Promise<{ title: string; entries: Array<{ videoId: string; title: string | null; url: string }> } | null> {
+  return new Promise((resolve) => {
+    const proc = spawn(
+      "yt-dlp",
+      ["--flat-playlist", "--dump-single-json", "--no-warnings", ...YTDLP_BASE_ARGS, url],
+      { stdio: ["ignore", "pipe", "ignore"], timeout: 30000 }
+    );
+    let output = "";
+    proc.stdout.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+    proc.on("close", () => {
+      try {
+        const data = JSON.parse(output.trim());
+        const entries = (data.entries || [])
+          .filter((e: any) => e.id)
+          .map((e: any) => ({
+            videoId: String(e.id),
+            title: e.title ? String(e.title) : null,
+            url: source === "youtube"
+              ? `https://www.youtube.com/watch?v=${e.id}`
+              : String(e.webpage_url || e.url || ""),
+          }))
+          .filter((e: { url: string }) => e.url);
+        resolve({ title: data.title || "Playlist", entries });
+      } catch {
+        resolve(null);
+      }
+    });
+    proc.on("error", () => resolve(null));
+  });
+}
+
 // Fully release a guild's playback: kill child processes, stop the player,
 // destroy the voice connection, and drop all per-guild state. Idempotent.
 function teardownGuild(guildId: string) {
@@ -463,9 +428,6 @@ function teardownGuild(guildId: string) {
   recentSkip.delete(guildId);
   emptySince.delete(guildId);
   aloneSince.delete(guildId);
-  // Drop the room mapping BEFORE stopping the player: stop() fires Idle, and the
-  // Idle handler must not find a room to advance into while we're tearing down.
-  guildRoomMap.delete(guildId);
   const track = currentTracks.get(guildId);
   track?.cleanup();
   currentTracks.delete(guildId);
@@ -487,21 +449,24 @@ function setupPlayer(guildId: string): AudioPlayer {
 
   player.on(AudioPlayerStatus.Idle, async () => {
     const track = currentTracks.get(guildId);
-    const playedMs = track ? Date.now() - track.startedAt : 0;
-    const wasSkip = recentSkip.delete(guildId); // consume the skip marker, if any
-    if (track) {
-      track.cleanup();
-      await db.update(songs).set({ played: true }).where(eq(songs.id, track.songId)).run();
-      await db.delete(skipVotes).where(eq(skipVotes.songId, track.songId)).run();
-      currentTracks.delete(guildId);
-    }
+    // teardownGuild clears currentTracks before stopping the player, and stop()
+    // emits this synchronously, so a teardown (or a duplicate Idle) must not
+    // reach the advance and failure logic below — that used to be prevented by
+    // the room binding being deleted first.
+    if (!track) return;
 
-    const roomId = guildRoomMap.get(guildId);
-    if (!roomId) return;
+    const playedMs = Date.now() - track.startedAt;
+    const wasSkip = recentSkip.delete(guildId); // consume the skip marker, if any
+    track.cleanup();
+    await db.update(songs).set({ played: true }).where(eq(songs.id, track.songId)).run();
+    await db.delete(skipVotes).where(eq(skipVotes.songId, track.songId)).run();
+    currentTracks.delete(guildId);
+
+    const roomId = guildId;
 
     // Healthy advance: an intentional user skip, or a track that actually played
     // for a while. Reset the failure streak and move on immediately.
-    if (wasSkip || !track || playedMs >= FAST_FAIL_MS) {
+    if (wasSkip || playedMs >= FAST_FAIL_MS) {
       consecutiveFailures.set(guildId, 0);
       console.log(`⏹️ Track finished in guild ${guildId} (${(playedMs / 1000).toFixed(0)}s)`);
       await playNextFromRoom(roomId, guildId);
@@ -589,6 +554,101 @@ async function playNextFromRoom(roomId: string, guildId: string) {
   }
 }
 
+// The song actually streaming, else the vote-order pick when nothing is
+// streaming (bot not connected) — the same anchor both skip routes use, so a
+// pending song that overtook the playing one in votes cannot be marked played
+// while the real track keeps streaming.
+async function currentSongForRoom(roomId: string, guildId: string): Promise<Song | null> {
+  const track = currentTracks.get(guildId);
+  if (track) {
+    return (await db.select().from(songs).where(eq(songs.id, track.songId)).get()) ?? null;
+  }
+  return (
+    (await db
+      .select()
+      .from(songs)
+      .where(and(eq(songs.roomId, roomId), eq(songs.played, false)))
+      .orderBy(desc(songs.votes), songs.createdAt, songs.id)
+      .get()) ?? null
+  );
+}
+
+async function skipVoteCount(songId: number): Promise<number> {
+  return (
+    await db.select({ c: sql<number>`count(*)` }).from(skipVotes).where(eq(skipVotes.songId, songId)).get()
+  )?.c ?? 0;
+}
+
+// Mark played before stopping the player, the order both skip routes use, so
+// the DB is already consistent when the Idle handler tries to mark it again.
+async function markSkipped(guildId: string, songId: number): Promise<void> {
+  await db.update(songs).set({ played: true }).where(eq(songs.id, songId)).run();
+  await db.delete(skipVotes).where(eq(skipVotes.songId, songId)).run();
+  recentSkip.add(guildId);
+  players.get(guildId)?.stop();
+}
+
+function nowPlayingEmbed(song: Song): EmbedBuilder {
+  const embed = new EmbedBuilder()
+    .setTitle(song.title?.trim() || song.videoId)
+    .setURL(song.url)
+    .setFooter({ text: song.addedBy ? `Added by ${song.addedBy}` : "Now playing" });
+  const thumbnail =
+    song.thumbnail ??
+    (song.source === "youtube" ? `https://i.ytimg.com/vi/${song.videoId}/hqdefault.jpg` : null);
+  return thumbnail ? embed.setThumbnail(thumbnail) : embed;
+}
+
+// The card follows the track: edit the previous one when it still exists,
+// otherwise post a new one. No Discord failure here may disturb playback, which
+// is already streaming by the time this runs.
+async function publishNowPlaying(guildId: string, song: Song): Promise<void> {
+  const channelId = guildTextChannel.get(guildId);
+  if (!channelId) return;
+  try {
+    const channel = await discord.channels.fetch(channelId);
+    if (!channel?.isTextBased()) return;
+    const buttons = [
+      new ButtonBuilder()
+        .setCustomId(encodeId("p_skipvote", guildId))
+        .setLabel("Vote skip")
+        .setEmoji("🗳️")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(encodeId("p_skip", guildId))
+        .setLabel("Skip")
+        .setEmoji("⏭️")
+        .setStyle(ButtonStyle.Secondary),
+    ];
+    // A playlist-backed track gets the bulk skip; a lone URL has nothing else to skip.
+    if (song.playlistId) {
+      buttons.push(
+        new ButtonBuilder()
+          .setCustomId(encodeId("p_skippl", guildId))
+          .setLabel("Skip playlist")
+          .setEmoji("⏩")
+          .setStyle(ButtonStyle.Secondary)
+      );
+    }
+    const payload = {
+      embeds: [nowPlayingEmbed(song)],
+      components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
+    };
+    const previous = nowPlayingMessage.get(guildId);
+    if (previous?.channelId === channelId) {
+      const message = await channel.messages.fetch(previous.messageId).catch(() => null);
+      if (message) {
+        await message.edit(payload);
+        return;
+      }
+    }
+    const sent = await (channel as TextChannel).send(payload);
+    nowPlayingMessage.set(guildId, { channelId, messageId: sent.id });
+  } catch (err) {
+    console.error(`⚠️ Could not publish the now-playing card for guild ${guildId}:`, err);
+  }
+}
+
 async function playNextFromRoomInner(roomId: string, guildId: string) {
   // Don't clobber a track that's already streaming. The current song stays
   // `played = false` until it finishes, so without this guard we'd re-pick it
@@ -600,7 +660,7 @@ async function playNextFromRoomInner(roomId: string, guildId: string) {
     .select()
     .from(songs)
     .where(eq(songs.roomId, roomId))
-    .orderBy(desc(songs.votes), songs.createdAt)
+    .orderBy(desc(songs.votes), songs.createdAt, songs.id)
     .all();
 
   const nextSong = allSongs.find((s) => !s.played);
@@ -678,35 +738,12 @@ async function playNextFromRoomInner(roomId: string, guildId: string) {
     startedAt: Date.now(),
     cleanup,
   });
+
+  await publishNowPlaying(guildId, nextSong);
 }
 
 // --- Hono API ---
 const app = new Hono();
-
-// Skip request logging for the high-frequency songs poll: every connected client
-// hits it every ~4s, so logging it floods stdout and the json-file log driver.
-const requestLogger = logger();
-app.use("*", (c, next) =>
-  c.req.method === "GET" && /\/songs$/.test(c.req.path) ? next() : requestLogger(c, next)
-);
-app.use(
-  "*",
-  cors({
-    // Same-origin requests (no Origin header) always pass. Beyond that, allow
-    // the configured public origins, plus localhost/LAN only outside prod.
-    origin: (origin) => {
-      if (!origin) return origin;
-      if (CORS_ALLOWED_ORIGINS.has(origin)) return origin;
-      if (
-        !IS_PROD &&
-        /^http:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+)(:\d+)?$/.test(origin)
-      )
-        return origin;
-      return null;
-    },
-    credentials: true,
-  })
-);
 
 // Centralised error + 404 handling so an unexpected throw returns a clean 500
 // (and is logged) instead of leaking a stack trace.
@@ -727,897 +764,21 @@ app.get("/ready", async (c) => {
   }
 });
 
-// Bot invite: redirect to Discord's OAuth2 bot authorization page with the
-// minimum permissions the bot needs — view channels + send messages for slash
-// commands, connect/speak/use-VAD for voice playback. Exposed as a redirect so
-// the frontend links here instead of duplicating the client id and permission
-// bitfield.
-app.get("/api/bot/invite", (c) => {
-  const permissions = new PermissionsBitField([
-    PermissionsBitField.Flags.ViewChannel,
-    PermissionsBitField.Flags.SendMessages,
-    PermissionsBitField.Flags.Connect,
-    PermissionsBitField.Flags.Speak,
-    PermissionsBitField.Flags.UseVAD,
-  ]);
-  const url = new URL("https://discord.com/api/oauth2/authorize");
-  url.searchParams.set("client_id", DISCORD_CLIENT_ID!);
-  url.searchParams.set("permissions", String(permissions.bitfield));
-  url.searchParams.set("scope", "bot applications.commands");
-  return c.redirect(url.toString());
-});
-
-// `source` picks how each flat-playlist entry's url is built: YouTube entries
-// reliably carry only an id, so the canonical watch url is reconstructed;
-// SoundCloud flat-playlist entries carry their own (sometimes internal API,
-// not the public webpage) url and never a title — titles for those are filled
-// in lazily by playNextFromRoomInner, same as any song missing a title.
-async function resolvePlaylist(
-  url: string,
-  source: Source
-): Promise<{ title: string; entries: Array<{ videoId: string; title: string | null; url: string }> } | null> {
-  return new Promise((resolve) => {
-    const proc = spawn(
-      "yt-dlp",
-      ["--flat-playlist", "--dump-single-json", "--no-warnings", ...YTDLP_BASE_ARGS, url],
-      { stdio: ["ignore", "pipe", "ignore"], timeout: 30000 }
-    );
-    let output = "";
-    proc.stdout.on("data", (chunk: Buffer) => { output += chunk.toString(); });
-    proc.on("close", () => {
-      try {
-        const data = JSON.parse(output.trim());
-        const entries = (data.entries || [])
-          .filter((e: any) => e.id)
-          .map((e: any) => ({
-            videoId: String(e.id),
-            title: e.title ? String(e.title) : null,
-            url: source === "youtube"
-              ? `https://www.youtube.com/watch?v=${e.id}`
-              : String(e.webpage_url || e.url || ""),
-          }))
-          .filter((e: { url: string }) => e.url);
-        resolve({ title: data.title || "Playlist", entries });
-      } catch {
-        resolve(null);
-      }
-    });
-    proc.on("error", () => resolve(null));
-  });
-}
-
-// ==================== AUTH ====================
-
-app.get("/auth/discord", (c) => {
-  // CSRF protection: bind this authorize request to the callback via a random
-  // state stored in a short-lived, http-only cookie.
-  const state = crypto.randomUUID();
-  setCookie(c, "b2b_oauth_state", state, {
-    httpOnly: true,
-    secure: IS_PROD,
-    sameSite: "Lax",
-    path: "/",
-    maxAge: 600,
-  });
-
-  const url = new URL("https://discord.com/api/oauth2/authorize");
-  url.searchParams.set("client_id", DISCORD_CLIENT_ID!);
-  url.searchParams.set("redirect_uri", DISCORD_REDIRECT_URI);
-  url.searchParams.set("response_type", "code");
-  url.searchParams.set("scope", "identify");
-  url.searchParams.set("state", state);
-  return c.redirect(url.toString());
-});
-
-app.get("/auth/discord/callback", async (c) => {
-  const code = c.req.query("code");
-  const state = c.req.query("state");
-  const cookieState = getCookie(c, "b2b_oauth_state");
-  // One-time use: clear the state cookie regardless of outcome.
-  setCookie(c, "b2b_oauth_state", "", { maxAge: 0, path: "/" });
-  if (!state || !cookieState || state !== cookieState)
-    return c.redirect(`${FRONTEND_URL}?error=state_mismatch`);
-  if (!code) return c.redirect(`${FRONTEND_URL}?error=no_code`);
-
-  const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: DISCORD_CLIENT_ID!,
-      client_secret: DISCORD_CLIENT_SECRET!,
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: DISCORD_REDIRECT_URI,
-    }),
-  });
-
-  const tokenData = await tokenRes.json();
-  if (!tokenData.access_token)
-    return c.redirect(`${FRONTEND_URL}?error=token_failed`);
-
-  const userRes = await fetch("https://discord.com/api/users/@me", {
-    headers: { Authorization: `Bearer ${tokenData.access_token}` },
-  });
-
-  const discordUser = await userRes.json();
-
-  const avatarUrl = discordUser.avatar
-    ? `https://cdn.discordapp.com/avatars/${discordUser.id}/${discordUser.avatar}.png`
-    : null;
-
-  // We only need identity; the Discord access/refresh tokens are never used
-  // again, so they are intentionally not persisted (data minimisation).
-  await db
-    .insert(users)
-    .values({
-      id: discordUser.id,
-      username: discordUser.username,
-      avatar: avatarUrl,
-    })
-    .onConflictDoUpdate({
-      target: users.id,
-      set: {
-        username: discordUser.username,
-        avatar: avatarUrl,
-      },
-    });
-
-  // Stamp the current token version into the JWT so a later logout (which bumps
-  // it) invalidates this token.
-  const dbUser = await db
-    .select({ tokenVersion: users.tokenVersion })
-    .from(users)
-    .where(eq(users.id, discordUser.id))
-    .get();
-
-  const token = await encodeJwt(
-    {
-      sub: discordUser.id,
-      username: discordUser.username,
-      avatar: avatarUrl,
-      tv: dbUser?.tokenVersion ?? 0,
-    },
-    JWT_SECRET,
-    TOKEN_TTL_SECONDS
-  );
-
-  setCookie(c, "b2b_token", token, {
-    httpOnly: true,
-    secure: IS_PROD, // HTTPS-only in production
-    sameSite: "Lax",
-    path: "/",
-    maxAge: TOKEN_TTL_SECONDS,
-  });
-
-  return c.redirect(FRONTEND_URL);
-});
-
-app.get("/api/auth/me", async (c) => {
-  const user = await getUser(c);
-  if (!user) return c.json({ user: null });
-  return c.json({
-    user: {
-      id: user.id,
-      username: user.username,
-      avatar: user.avatar,
-      isAdmin: isAdmin(user),
-    },
-  });
-});
-
-app.get("/auth/logout", async (c) => {
-  // Bump tokenVersion so any outstanding JWTs for this user stop validating —
-  // real revocation, not just clearing this browser's cookie.
-  const user = await getUser(c);
-  if (user) {
-    await db
-      .update(users)
-      .set({ tokenVersion: (user.tokenVersion ?? 0) + 1 })
-      .where(eq(users.id, user.id))
-      .run();
-  }
-  setCookie(c, "b2b_token", "", { maxAge: 0, path: "/" });
-  return c.redirect(FRONTEND_URL);
-});
-
-// ==================== ROOMS ====================
-
-// Track which room each Discord user is viewing
-const userCurrentRoom = new Map<string, string>(); // userId -> roomId
-
-// Read-only: a GET must not create or mutate a room (that would let a read
-// acquire ownership). Room rows are created by write paths (presence, song
-// POST, Discord /play).
-app.get("/api/rooms/:id", async (c) => {
-  const { id } = c.req.param();
-  const user = await getUser(c);
-  const room = await db.select().from(rooms).where(eq(rooms.id, id)).get();
-  const canDelete =
-    isAdmin(user) || (!!user && !!room?.createdBy && room.createdBy === user.id);
-  return c.json({
-    id,
-    name: room?.name ?? null,
-    createdBy: room?.createdBy ?? null,
-    createdAt: room?.createdAt ?? null,
-    lastActivityAt: room?.lastActivityAt ?? null,
-    exists: !!room,
-    canDelete,
-    isAdmin: isAdmin(user),
-  });
-});
-
-// Set / clear the user's current room (called from frontend).
-// A null or absent roomId means the user left the room, so we drop the mapping
-// and the Discord bot falls back to the guild as the default room.
-app.post("/api/user/room", async (c) => {
-  const user = await getUser(c);
-  if (!user) return c.json({ error: "Login required" }, 401);
-
-  const body = await c.req.json().catch(() => ({}));
-  const roomId: string | null = body?.roomId ?? null;
-
-  if (roomId) {
-    userCurrentRoom.set(user.id, roomId);
-    const room = await ensureRoom(roomId, user.id);
-    const canDelete =
-      isAdmin(user) || (!!room?.createdBy && room.createdBy === user.id);
-    console.log(`📍 User ${user.username} now in room ${roomId}`);
-    return c.json({ success: true, roomId, canDelete });
-  }
-
-  userCurrentRoom.delete(user.id);
-  console.log(`🚪 User ${user.username} left their room`);
-  return c.json({ success: true, roomId: null });
-});
-
-app.get("/api/rooms/:id/songs", async (c) => {
-  const { id } = c.req.param();
-  const user = await getUser(c);
-
-  const roomSongs = await db
-    .select()
-    .from(songs)
-    .where(eq(songs.roomId, id))
-    .orderBy(desc(songs.votes), songs.createdAt)
-    .all();
-
-  let userVotes: number[] = [];
-  if (user) {
-    // Scope to this room's songs (join) so the result is bounded by the room,
-    // not the user's entire vote history across every room they've ever used.
-    const userVoteRecords = await db
-      .select({ songId: votes.songId })
-      .from(votes)
-      .innerJoin(songs, eq(votes.songId, songs.id))
-      .where(and(eq(votes.userId, user.id), eq(songs.roomId, id)))
-      .all();
-    userVotes = userVoteRecords.map((v) => v.songId);
-  }
-
-  const presentCount = roomPresence(id);
-
-  const guildId = [...guildRoomMap.entries()].find(([, r]) => r === id)?.[0];
-  const track = guildId ? currentTracks.get(guildId) : null;
-  const currentSongStartedAt = track?.startedAt ?? null;
-  // The song actually streaming, not just the highest-voted unplayed one —
-  // those diverge once a pending song's votes overtake the one already
-  // playing (it stays played=false until it finishes). null when nothing is
-  // actively streaming (bot not connected yet), so the frontend can fall back
-  // to the vote-order heuristic in that case.
-  const currentSongId = track?.songId ?? null;
-
-  // The skip-vote tally must anchor to the same song the /skip-vote endpoint
-  // acts on: the streaming track when the bot is connected, else the
-  // vote-order first-unplayed fallback. currentSongId stays null when no bot
-  // is streaming (so the frontend can show "not connected"), but the tally
-  // uses the effective song so the counter is live even before the bot joins.
-  const fallback = roomSongs.find((s) => !s.played);
-  const effectiveSongId = track?.songId ?? fallback?.id ?? null;
-  let skipVotesCount = 0;
-  let userSkipVote = false;
-  if (effectiveSongId) {
-    const skipRows = await db
-      .select({ userId: skipVotes.userId })
-      .from(skipVotes)
-      .where(eq(skipVotes.songId, effectiveSongId))
-      .all();
-    skipVotesCount = skipRows.length;
-    if (user) userSkipVote = skipRows.some((r) => r.userId === user.id);
-  }
-
-  return c.json({ songs: roomSongs, userVotes, presentCount, currentSongStartedAt, currentSongId, skipVotesCount, userSkipVote });
-});
-
-app.post("/api/rooms/:id/songs", async (c) => {
-  const { id } = c.req.param();
-  const user = await getUser(c);
-  if (!user) return c.json({ error: "Login required" }, 401);
-  if (!rateLimit(`songs:${clientKey(c)}`, 30, 60_000))
-    return c.json({ error: "Too many requests" }, 429);
-
-  const body = await c.req.json();
-  const { url } = body;
-
-  const source = detectSource(url);
-  if (!source) return c.json({ error: "Invalid YouTube, SoundCloud, Mixcloud, Twitch, or streaming URL" }, 400);
-
-  await ensureRoom(id, user.id);
-
-  if (isPlaylistUrl(url) || isSoundcloudSetUrl(url)) {
-    const playlist = await resolvePlaylist(url, source);
-    if (!playlist || playlist.entries.length === 0)
-      return c.json({ error: "Could not resolve playlist" }, 400);
-
-    const playlistId = crypto.randomUUID();
-    await db.insert(songs).values(
-      playlist.entries.map((e) => ({
-        roomId: id,
-        videoId: e.videoId,
-        source,
-        url: e.url,
-        title: e.title,
-        addedBy: user.username,
-        addedByUserId: user.id,
-        playlistId,
-        playlistTitle: playlist.title,
-      }))
-    );
-
-    for (const [guildId, roomId] of guildRoomMap) {
-      if (roomId === id && connections.has(guildId) && !currentTracks.has(guildId)) {
-        playNextFromRoom(id, guildId);
-        break;
-      }
-    }
-
-    console.log(`📋 Playlist "${playlist.title}" (${playlist.entries.length} songs) added to room ${id}`);
-    return c.json({ playlistId, count: playlist.entries.length }, 201);
-  }
-
-  const resolved = await resolveSingleTrack(url, source);
-  if (!resolved) return c.json({ error: "Could not resolve track" }, 400);
-
-  const song = await db
-    .insert(songs)
-    .values({
-      roomId: id,
-      videoId: resolved.videoId,
-      source,
-      url: resolved.url,
-      title: resolved.title,
-      uploader: resolved.uploader,
-      thumbnail: resolved.thumbnail,
-      addedBy: user.username,
-      addedByUserId: user.id,
-    })
-    .returning()
-    .get();
-
-  for (const [guildId, roomId] of guildRoomMap) {
-    if (roomId === id && connections.has(guildId) && !currentTracks.has(guildId)) {
-      playNextFromRoom(id, guildId);
-      break;
-    }
-  }
-
-  return c.json(song, 201);
-});
-
-app.post("/api/rooms/:id/songs/:songId/vote", async (c) => {
-  const { songId } = c.req.param();
-  const user = await getUser(c);
-
-  if (!user) return c.json({ error: "Login required to vote" }, 401);
-
-  const song = await db
-    .select()
-    .from(songs)
-    .where(eq(songs.id, Number(songId)))
-    .get();
-  if (!song) return c.json({ error: "Song not found" }, 404);
-
-  const existingVote = await db
-    .select()
-    .from(votes)
-    .where(and(eq(votes.songId, Number(songId)), eq(votes.userId, user.id)))
-    .get();
-
-  if (existingVote) return c.json({ error: "Already voted" }, 409);
-
-  await db.insert(votes).values({ songId: Number(songId), userId: user.id });
-
-  const updated = await db
-    .update(songs)
-    .set({ votes: song.votes! + 1 })
-    .where(eq(songs.id, Number(songId)))
-    .returning()
-    .get();
-
-  return c.json(updated);
-});
-
-// Skip the current song. Requires votes >= skipThreshold(presentCount).
-// The threshold is enforced server-side so the frontend can't bypass it.
-app.post("/api/rooms/:id/skip", async (c) => {
-  const { id } = c.req.param();
-  const user = await getUser(c);
-  if (!user) return c.json({ error: "Login required" }, 401);
-
-  const presentCount = roomPresence(id);
-  const threshold = skipThreshold(presentCount);
-
-  const guildId = [...guildRoomMap.entries()].find(([, r]) => r === id)?.[0];
-  const track = guildId ? currentTracks.get(guildId) : null;
-
-  // Anchor to the song actually streaming (currentTracks), not the
-  // highest-voted unplayed one — those diverge once a pending song's votes
-  // overtake the one already playing (it stays played=false until it
-  // finishes), which would otherwise let a vote-skip mark the wrong song
-  // played while the real track keeps streaming. Fall back to the vote-order
-  // pick only when nothing is actively streaming (bot not connected).
-  const current = track
-    ? await db.select().from(songs).where(eq(songs.id, track.songId)).get()
-    : await db
-        .select()
-        .from(songs)
-        .where(and(eq(songs.roomId, id), eq(songs.played, false)))
-        .orderBy(desc(songs.votes), songs.createdAt)
-        .get();
-
-  if (!current) return c.json({ error: "Nothing playing" }, 404);
-  const isOwner = current.addedByUserId === user.id;
-  const skipVotesCount = (await db.select({ c: sql<number>`count(*)` }).from(skipVotes).where(eq(skipVotes.songId, current.id)).get())?.c ?? 0;
-  if (!isOwner && skipVotesCount < threshold) return c.json({ error: "Not enough votes", skipVotes: skipVotesCount, threshold }, 403);
-
-  // Mark as played before stopping the player so the DB is consistent when the
-  // frontend refetches. The Idle handler will try to mark it again — harmless.
-  await db.update(songs).set({ played: true }).where(eq(songs.id, current.id)).run();
-  await db.delete(skipVotes).where(eq(skipVotes.songId, current.id)).run();
-
-  if (guildId) {
-    recentSkip.add(guildId);
-    players.get(guildId)?.stop();
-  }
-
-  console.log(`⏭️ Song "${current.title}" skipped in room ${id} by ${user.username} (${skipVotesCount}/${threshold} skip-votes)`);
-  return c.json({ success: true });
-});
-
-// Register a skip-vote for the current song. The adder can skip directly
-// (owner bypass); otherwise the vote is tallied and the skip auto-executes
-// once skipVotes >= skipThreshold(roomPresence). This replaces the old model
-// where upvotes doubled as skip authority — inverted, since a popular song
-// (many upvotes) was easier to skip than an unpopular one.
-app.post("/api/rooms/:id/skip-vote", async (c) => {
-  const { id } = c.req.param();
-  const user = await getUser(c);
-  if (!user) return c.json({ error: "Login required" }, 401);
-
-  const guildId = [...guildRoomMap.entries()].find(([, r]) => r === id)?.[0];
-  const track = guildId ? currentTracks.get(guildId) : null;
-  const current = track
-    ? await db.select().from(songs).where(eq(songs.id, track.songId)).get()
-    : await db
-        .select()
-        .from(songs)
-        .where(and(eq(songs.roomId, id), eq(songs.played, false)))
-        .orderBy(desc(songs.votes), songs.createdAt)
-        .get();
-
-  if (!current) return c.json({ error: "Nothing playing" }, 404);
-
-  const threshold = skipThreshold(roomPresence(id));
-  const isOwner = !!current.addedByUserId && current.addedByUserId === user.id;
-
-  if (isOwner) {
-    await db.update(songs).set({ played: true }).where(eq(songs.id, current.id)).run();
-    await db.delete(skipVotes).where(eq(skipVotes.songId, current.id)).run();
-    if (guildId) { recentSkip.add(guildId); players.get(guildId)?.stop(); }
-    console.log(`⏭️ Song "${current.title}" skip-voted (owner) in room ${id} by ${user.username}`);
-    return c.json({ skipped: true });
-  }
-
-  const existing = await db
-    .select()
-    .from(skipVotes)
-    .where(and(eq(skipVotes.songId, current.id), eq(skipVotes.userId, user.id)))
-    .get();
-  if (existing) return c.json({ error: "Already voted to skip" }, 409);
-
-  await db.insert(skipVotes).values({ songId: current.id, userId: user.id }).run();
-  const count = (await db.select({ c: sql<number>`count(*)` }).from(skipVotes).where(eq(skipVotes.songId, current.id)).get())?.c ?? 0;
-
-  if (count >= threshold) {
-    await db.update(songs).set({ played: true }).where(eq(songs.id, current.id)).run();
-    await db.delete(skipVotes).where(eq(skipVotes.songId, current.id)).run();
-    if (guildId) { recentSkip.add(guildId); players.get(guildId)?.stop(); }
-    console.log(`⏭️ Song "${current.title}" skipped by vote in room ${id} (${count}/${threshold})`);
-    return c.json({ skipped: true });
-  }
-
-  return c.json({ skipped: false, skipVotes: count, threshold });
-});
-
-// Skip all remaining songs in a playlist. Only the user who added the playlist
-// or an admin can do this — it's a bulk action that bypasses per-song voting.
-app.post("/api/rooms/:id/playlists/:playlistId/skip", async (c) => {
-  const { id, playlistId } = c.req.param();
-  const user = await getUser(c);
-  if (!user) return c.json({ error: "Login required" }, 401);
-
-  const playlistSongs = await db
-    .select()
-    .from(songs)
-    .where(and(eq(songs.roomId, id), eq(songs.playlistId, playlistId), eq(songs.played, false)))
-    .all();
-
-  if (playlistSongs.length === 0) return c.json({ error: "No pending songs in playlist" }, 404);
-
-  const isOwner = playlistSongs[0].addedByUserId === user.id;
-  if (!isOwner && !isAdmin(user)) return c.json({ error: "Not authorized" }, 403);
-
-  const ids = playlistSongs.map((s) => s.id);
-  await db.update(songs).set({ played: true }).where(inArray(songs.id, ids)).run();
-  await db.delete(skipVotes).where(inArray(skipVotes.songId, ids)).run();
-
-  // Stop the player if the current track belongs to this playlist.
-  for (const [guildId, roomId] of guildRoomMap) {
-    if (roomId === id) {
-      const track = currentTracks.get(guildId);
-      if (track && ids.includes(track.songId)) {
-        recentSkip.add(guildId);
-        players.get(guildId)?.stop();
-      }
-      break;
-    }
-  }
-
-  console.log(`⏭️ Playlist "${playlistSongs[0].playlistTitle}" skipped in room ${id} by ${user.username}`);
-  return c.json({ success: true, skipped: ids.length });
-});
-
-app.delete("/api/rooms/:id/songs/:songId", async (c) => {
-  const { songId } = c.req.param();
-  const user = await getUser(c);
-  if (!user) return c.json({ error: "Login required" }, 401);
-
-  const song = await db
-    .select()
-    .from(songs)
-    .where(eq(songs.id, Number(songId)))
-    .get();
-  if (!song) return c.json({ error: "Song not found" }, 404);
-
-  // Deny by default: only the song's adder or a global admin may delete it.
-  const isOwner = !!song.addedByUserId && song.addedByUserId === user.id;
-  if (!isOwner && !isAdmin(user)) {
-    return c.json({ error: "Not authorized" }, 403);
-  }
-
-  await db.transaction(async (tx) => {
-    await tx.delete(votes).where(eq(votes.songId, Number(songId)));
-    await tx.delete(skipVotes).where(eq(skipVotes.songId, Number(songId)));
-    await tx.delete(songs).where(eq(songs.id, Number(songId)));
-  });
-  return c.json({ success: true });
-});
-
-// Delete a whole room. Allowed for the room owner or a global admin.
-app.delete("/api/rooms/:id", async (c) => {
-  const { id } = c.req.param();
-  const user = await getUser(c);
-  if (!user) return c.json({ error: "Login required" }, 401);
-
-  const room = await db.select().from(rooms).where(eq(rooms.id, id)).get();
-  if (!room) return c.json({ error: "Room not found" }, 404);
-
-  const isOwner = !!room.createdBy && room.createdBy === user.id;
-  if (!isOwner && !isAdmin(user)) {
-    return c.json({ error: "Not authorized" }, 403);
-  }
-
-  // Atomic cascade (votes -> songs -> room) so a crash can't leave a
-  // half-deleted room. FKs are enforced by libSQL, hence the explicit order.
-  const roomSongs = await db
-    .select({ id: songs.id })
-    .from(songs)
-    .where(eq(songs.roomId, id))
-    .all();
-  const songIds = roomSongs.map((s) => s.id);
-  await db.transaction(async (tx) => {
-    if (songIds.length > 0) {
-      await tx.delete(votes).where(inArray(votes.songId, songIds));
-      await tx.delete(skipVotes).where(inArray(skipVotes.songId, songIds));
-      await tx.delete(songs).where(eq(songs.roomId, id));
-    }
-    await tx.delete(rooms).where(eq(rooms.id, id));
-  });
-
-  // Tear down any live presence / Discord playback bound to this room.
-  for (const [uid, rid] of userCurrentRoom) {
-    if (rid === id) userCurrentRoom.delete(uid);
-  }
-  for (const [guildId, rid] of guildRoomMap) {
-    if (rid === id) teardownGuild(guildId);
-  }
-
-  console.log(
-    `🗑️ Room ${id} deleted by ${user.username}${
-      isOwner ? " (owner)" : " (admin)"
-    }`
-  );
-  return c.json({ success: true });
-});
-
-// ==================== SEARCH ====================
-
-app.get("/api/search", async (c) => {
-  const user = await getUser(c);
-  if (!user) return c.json({ error: "Login required" }, 401);
-  if (!rateLimit(`search:${clientKey(c)}`, 20, 60_000))
-    return c.json({ error: "Too many requests" }, 429);
-
-  const q = (c.req.query("q") || "").trim();
-  if (!q) return c.json({ results: [] });
-
-  const n = Math.min(Number(c.req.query("n") || 5), 10);
-  const rawSource = c.req.query("source");
-  const source: Source = rawSource === "soundcloud" ? "soundcloud" : rawSource === "twitch" ? "twitch" : "youtube";
-  const searchPrefix = source === "youtube" ? "ytsearch" : source === "twitch" ? "twitchsearch" : "scsearch";
-
-  type SearchResult = {
-    source: Source;
-    videoId: string;
-    title: string;
-    duration: number | null;
-    uploader: string | null;
-    url: string;
-    thumbnail: string | null;
-  };
-  const results = await new Promise<SearchResult[]>((resolve) => {
-    const proc = spawn(
-      "yt-dlp",
-      [`${searchPrefix}${n}:${q}`, "--dump-json", "--flat-playlist", "--no-warnings", ...YTDLP_BASE_ARGS],
-      { stdio: ["ignore", "pipe", "ignore"] }
-    );
-
-    let output = "";
-    let done = false;
-    const finish = (val: SearchResult[]) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      resolve(val);
-    };
-    // Kill a hung yt-dlp instead of leaking the process and never responding.
-    const timer = setTimeout(() => {
-      try { proc.kill("SIGKILL"); } catch {}
-      finish([]);
-    }, 15_000);
-
-    proc.stdout.on("data", (chunk: Buffer) => {
-      output += chunk.toString();
-      // Cap the buffer so a pathological response can't exhaust memory.
-      if (output.length > 1_000_000) {
-        try { proc.kill("SIGKILL"); } catch {}
-        finish([]);
-      }
-    });
-    proc.on("close", () => {
-      const parsed = output
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .flatMap((line) => {
-          try {
-            const e = JSON.parse(line);
-            if (!e.id || !e.title) return [];
-            const videoId = String(e.id);
-            const url = source === "youtube"
-              ? `https://www.youtube.com/watch?v=${videoId}`
-              : String(e.webpage_url || e.url || "");
-            if (!url) return [];
-            const thumbnail = source === "youtube"
-              ? `https://i.ytimg.com/vi/${videoId}/default.jpg`
-              : (e.thumbnail ?? e.thumbnails?.at(-1)?.url ?? null);
-            return [{ source, videoId, title: String(e.title), duration: e.duration ?? null, uploader: e.uploader ?? null, url, thumbnail }];
-          } catch {
-            return [];
-          }
-        });
-      finish(parsed);
-    });
-    proc.on("error", () => finish([]));
-    // Cancel the spawn if the client disconnects mid-request.
-    c.req.raw.signal?.addEventListener("abort", () => {
-      try { proc.kill("SIGKILL"); } catch {}
-      finish([]);
-    });
-  });
-
-  return c.json({ results });
-});
-
-// Connect the bot to wherever the authenticated user is currently in voice.
-// A Discord user can only be in one voice channel at a time, so we iterate
-// the bot's guilds until we find their voice state.
-app.post("/api/rooms/:id/connect", async (c) => {
-  const { id } = c.req.param();
-  const user = await getUser(c);
-  if (!user) return c.json({ error: "Login required" }, 401);
-
-  let foundGuildId: string | null = null;
-  let foundChannelId: string | null = null;
-  let foundChannelName: string | null = null;
-
-  for (const guild of discord.guilds.cache.values()) {
-    const vs = guild.voiceStates.cache.get(user.id);
-    if (vs?.channel) {
-      foundGuildId = guild.id;
-      foundChannelId = vs.channel.id;
-      foundChannelName = vs.channel.name;
-      break;
-    }
-  }
-
-  if (!foundGuildId || !foundChannelId) {
-    return c.json({ error: "Not in a voice channel" }, 404);
-  }
-
-  await ensureRoom(id, user.id);
-  guildRoomMap.set(foundGuildId, id);
-  await connectToVoiceChannel(foundGuildId, foundChannelId);
-  await playNextFromRoom(id, foundGuildId);
-
-  console.log(`🔊 Bot summoned by ${user.username} to ${foundChannelName} (guild ${foundGuildId})`);
-  return c.json({ success: true, channelName: foundChannelName });
-});
-
-// ==================== ADMIN / MODERATION ====================
-
-// Lightweight operational metrics. Admin-only (scrape with the admin cookie).
+// Operational metrics. Gated by a bearer token from METRICS_TOKEN; when the
+// variable is unset the endpoint is disabled entirely (fail closed).
 app.get("/metrics", async (c) => {
-  const user = await getUser(c);
-  if (!isAdmin(user)) return c.json({ error: "Not authorized" }, 403);
+  if (!METRICS_TOKEN) return c.json({ error: "Metrics disabled" }, 403);
+  if (c.req.header("authorization") !== `Bearer ${METRICS_TOKEN}`)
+    return c.json({ error: "Not authorized" }, 403);
   const roomCount =
     (await db.select({ c: sql<number>`count(*)` }).from(rooms).get())?.c ?? 0;
   return c.json({
     rooms: Number(roomCount),
     voiceConnections: connections.size,
     tracksPlaying: currentTracks.size,
-    usersPresent: userCurrentRoom.size,
-    rateBuckets: rateBuckets.size,
     uptimeSeconds: Math.floor(process.uptime()),
   });
 });
-
-// List every room with moderation metadata. Admin-only.
-app.get("/api/admin/rooms", async (c) => {
-  const user = await getUser(c);
-  if (!user) return c.json({ error: "Login required" }, 401);
-  if (!isAdmin(user)) return c.json({ error: "Not authorized" }, 403);
-
-  const allRooms = await db
-    .select()
-    .from(rooms)
-    .orderBy(desc(rooms.lastActivityAt))
-    .all();
-
-  // Song counts per room in one grouped query (avoid N+1).
-  const counts = await db
-    .select({
-      roomId: songs.roomId,
-      total: sql<number>`count(*)`,
-      pending: sql<number>`sum(case when coalesce(${songs.played}, 0) = 0 then 1 else 0 end)`,
-    })
-    .from(songs)
-    .groupBy(songs.roomId)
-    .all();
-  const countByRoom = new Map(counts.map((r) => [r.roomId, r]));
-
-  // Live presence (in-memory): users currently viewing each room, plus
-  // Discord listeners in the bot's voice channel for guilds bound to the room.
-  const presentByRoom = new Map<string, number>();
-  for (const roomId of userCurrentRoom.values()) {
-    presentByRoom.set(roomId, (presentByRoom.get(roomId) ?? 0) + 1);
-  }
-  for (const [roomId, count] of voicePresenceByRoom()) {
-    presentByRoom.set(roomId, (presentByRoom.get(roomId) ?? 0) + count);
-  }
-
-  // Resolve owner usernames in one query.
-  const ownerIds = [
-    ...new Set(allRooms.map((r) => r.createdBy).filter(Boolean) as string[]),
-  ];
-  const owners = ownerIds.length
-    ? await db
-        .select({ id: users.id, username: users.username })
-        .from(users)
-        .where(inArray(users.id, ownerIds))
-        .all()
-    : [];
-  const ownerName = new Map(owners.map((o) => [o.id, o.username]));
-
-  const list = allRooms.map((room) => ({
-    id: room.id,
-    createdBy: room.createdBy,
-    ownerName: room.createdBy ? ownerName.get(room.createdBy) ?? null : null,
-    songCount: Number(countByRoom.get(room.id)?.total ?? 0),
-    pendingCount: Number(countByRoom.get(room.id)?.pending ?? 0),
-    presentCount: presentByRoom.get(room.id) ?? 0,
-    lastActivityAt: room.lastActivityAt,
-    createdAt: room.createdAt,
-  }));
-
-  return c.json({ rooms: list, count: list.length });
-});
-
-// List every guild with approval status. Admin-only.
-app.get("/api/admin/guilds", async (c) => {
-  const user = await getUser(c);
-  if (!user) return c.json({ error: "Login required" }, 401);
-  if (!isAdmin(user)) return c.json({ error: "Not authorized" }, 403);
-
-  const allGuilds = await db.select().from(guilds).orderBy(desc(guilds.requestedAt)).all();
-  return c.json({ guilds: allGuilds });
-});
-
-// Approve a pending guild — the bot becomes active there.
-app.post("/api/admin/guilds/:guildId/approve", async (c) => {
-  const { guildId } = c.req.param();
-  const user = await getUser(c);
-  if (!user) return c.json({ error: "Login required" }, 401);
-  if (!isAdmin(user)) return c.json({ error: "Not authorized" }, 403);
-
-  await db
-    .update(guilds)
-    .set({ approved: true, approvedAt: nowSeconds() })
-    .where(eq(guilds.id, guildId))
-    .run();
-  console.log(`✅ Guild ${guildId} approved by ${user.username}`);
-  return c.json({ success: true });
-});
-
-// Reject a guild — removes the record and leaves the Discord server.
-app.post("/api/admin/guilds/:guildId/reject", async (c) => {
-  const { guildId } = c.req.param();
-  const user = await getUser(c);
-  if (!user) return c.json({ error: "Login required" }, 401);
-  if (!isAdmin(user)) return c.json({ error: "Not authorized" }, 403);
-
-  await db.delete(guilds).where(eq(guilds.id, guildId)).run();
-  teardownGuild(guildId);
-  const guild = discord.guilds.cache.get(guildId);
-  if (guild) {
-    try { await guild.leave(); } catch (e) { console.error(`Failed to leave guild ${guildId}:`, e); }
-  }
-  console.log(`❌ Guild ${guildId} rejected by ${user.username}`);
-  return c.json({ success: true });
-});
-
-// ==================== STATIC FILES (merged web) ====================
-// In production the Vite-built frontend is bundled into the server image.
-// Serve it as static files with SPA fallback for client-side routing.
-if (IS_PROD) {
-  const API_PREFIXES = ["/api", "/auth", "/health", "/ready", "/metrics"];
-  app.get("*", async (c) => {
-    const p = c.req.path;
-    if (API_PREFIXES.some((prefix) => p.startsWith(prefix))) {
-      return c.json({ error: "Not found" }, 404);
-    }
-    const file = Bun.file(path.join(WEB_DIST_DIR, p));
-    if (await file.exists()) {
-      return new Response(file, {
-        headers: { "Content-Type": file.type || "application/octet-stream" },
-      });
-    }
-    // SPA fallback — serve index.html for client-side routes
-    const indexFile = Bun.file(INDEX_HTML);
-    return new Response(indexFile, {
-      headers: { "Content-Type": "text/html; charset=utf-8" },
-    });
-  });
-}
 
 // ==================== DISCORD BOT ====================
 
@@ -1649,6 +810,8 @@ discord.once(Events.ClientReady, async (c) => {
       }).run();
     }
   }
+
+  try { await purgeUnreachableRooms(); } catch (err) { console.error("purgeUnreachableRooms failed:", err); }
 });
 
 // New guilds start as pending approval — the bot joins but stays dormant
@@ -1670,15 +833,232 @@ discord.on(Events.GuildCreate, async (guild) => {
 discord.on(Events.GuildDelete, async (guild) => {
   await db.delete(guilds).where(eq(guilds.id, guild.id)).run();
   teardownGuild(guild.id);
+  guildTextChannel.delete(guild.id);
+  nowPlayingMessage.delete(guild.id);
   console.log(`🗑️ Guild "${guild.name}" (${guild.id}) removed`);
 });
 
+// Queue a track for a guild: the voice gate, room resolution and play-order
+// live here so /play and the /search picker cannot drift apart. Callers own
+// URL/source validation and the interaction has already been acknowledged iff
+// `interaction.replied`/`deferred` is set.
+async function queueTrackForGuild(
+  interaction: ChatInputCommandInteraction | StringSelectMenuInteraction,
+  guildId: string,
+  url: string,
+  source: Source
+) {
+  const voiceChannel = interaction.member?.voice?.channel as VoiceBasedChannel | null | undefined;
+  if (!voiceChannel) {
+    if (interaction.deferred || interaction.replied) await interaction.editReply("You need to be in a voice channel!");
+    else await interaction.reply("You need to be in a voice channel!");
+    return;
+  }
+
+  if (!interaction.deferred && !interaction.replied) await interaction.deferReply();
+
+  const roomId = guildId;
+
+  await ensureRoom(roomId, interaction.user.id);
+
+  // A playlist and a single track differ only in how many rows they produce;
+  // both end in the same insert and play tail, so their order and room binding
+  // cannot drift apart.
+  let label: string;
+  let rows: (typeof songs.$inferInsert)[];
+
+  if (isPlaylistUrl(url) || isSoundcloudSetUrl(url)) {
+    const playlist = await resolvePlaylist(url, source);
+    if (!playlist || playlist.entries.length === 0) {
+      await interaction.editReply("Could not resolve playlist");
+      return;
+    }
+
+    const playlistId = crypto.randomUUID();
+    rows = playlist.entries.map((e) => ({
+      roomId,
+      videoId: e.videoId,
+      source,
+      url: e.url,
+      title: e.title,
+      addedBy: interaction.user.username,
+      addedByUserId: interaction.user.id,
+      playlistId,
+      playlistTitle: playlist.title,
+    }));
+    label = `📋 Added playlist **${playlist.title}** — ${playlist.entries.length} songs`;
+  } else {
+    const resolved = await resolveSingleTrack(url, source);
+    if (!resolved) {
+      await interaction.editReply("Could not resolve track");
+      return;
+    }
+
+    rows = [{
+      roomId,
+      videoId: resolved.videoId,
+      source,
+      url: resolved.url,
+      title: resolved.title,
+      uploader: resolved.uploader,
+      thumbnail: resolved.thumbnail,
+      addedBy: interaction.user.username,
+      addedByUserId: interaction.user.id,
+    }];
+    label = `Added to queue: **${resolved.title || url}**`;
+  }
+
+  await db.insert(songs).values(rows);
+
+  await new Promise((r) => setTimeout(r, 50));
+
+  await connectToVoiceChannel(guildId, voiceChannel.id);
+  await playNextFromRoom(roomId, guildId);
+
+  await interaction.editReply({ content: label, components: [] });
+}
+
+// The queue read-model every /queue surface shares: the unplayed, vote-ordered
+// rows auto-advance and the /queue panel both use, so the command and its
+// buttons, selects, and re-renders can never disagree about what is queued.
+// `id` is the tiebreaker because a playlist's rows share one `createdAt` second
+// and would otherwise play in an arbitrary order while their votes are equal.
+async function loadQueue(roomId: string): Promise<QueueSong[]> {
+  const rows = await db
+    .select()
+    .from(songs)
+    .where(eq(songs.roomId, roomId))
+    .orderBy(desc(songs.votes), songs.createdAt, songs.id)
+    .all();
+  return rows.filter((s) => !s.played);
+}
+
+// Rebuild the whole panel from a freshly loaded queue. A stale message left in
+// a channel must never render or act on state the database no longer has.
+function queuePanel(queue: QueueSong[], page: number, guildId: string, userId: string) {
+  const view = formatQueuePage(queue, page);
+  const pageSongs = slicePage(queue, view.page);
+
+  const components: (
+    | ActionRowBuilder<ButtonBuilder>
+    | ActionRowBuilder<StringSelectMenuBuilder>
+  )[] = [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(encodeId("q_prev", view.page, guildId))
+        .setLabel("◀ Previous")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(view.page <= 1),
+      new ButtonBuilder()
+        .setCustomId(encodeId("q_refresh", view.page, guildId))
+        .setLabel("🔄 Refresh")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(encodeId("q_next", view.page, guildId))
+        .setLabel("Next ▶")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(view.page >= view.pageCount)
+    ),
+  ];
+
+  // Discord rejects a select with zero options, so an empty page drops the row.
+  if (pageSongs.length > 0) {
+    components.push(
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(encodeId("q_vote", view.page, guildId))
+          .setPlaceholder("Upvote a song")
+          .addOptions(
+            pageSongs.map((s) => ({
+              label: (s.title?.trim() || s.videoId).slice(0, 100),
+              value: String(s.id),
+            }))
+          )
+      )
+    );
+  }
+
+  // Only the songs this user added are removable, and an empty select is
+  // rejected by Discord — so omit the row entirely when the page has none.
+  const mine = pageSongs.filter((s) => s.addedByUserId === userId);
+  if (mine.length > 0) {
+    components.push(
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(encodeId("q_remove", view.page, guildId))
+          .setPlaceholder("Remove one of your songs")
+          .addOptions(
+            mine.map((s) => ({
+              label: (s.title?.trim() || s.videoId).slice(0, 100),
+              value: String(s.id),
+            }))
+          )
+      )
+    );
+  }
+
+  return { embeds: [new EmbedBuilder().setDescription(view.text)], components };
+}
+
+// Moderation overview for /admin. Every render reads the DB fresh so an action
+// never shows a list the database no longer has.
+async function adminView() {
+  const pending = await db
+    .select()
+    .from(guilds)
+    .where(eq(guilds.approved, false))
+    .orderBy(desc(guilds.requestedAt))
+    .all();
+  const roomCount = (await db.select({ c: sql<number>`count(*)` }).from(rooms).get())?.c ?? 0;
+  const songCount = (await db.select({ c: sql<number>`count(*)` }).from(songs).get())?.c ?? 0;
+
+  // Discord caps a select at 25 options, so the list is capped to match.
+  const options = pending.slice(0, 25).map((g) => ({
+    label: (g.name?.trim() || g.id).slice(0, 100),
+    value: g.id,
+  }));
+
+  const lines = [
+    `• Rooms: **${roomCount}**`,
+    `• Songs: **${songCount}**`,
+    `• Active voice connections: **${connections.size}**`,
+    "",
+    pending.length === 0
+      ? "✅ No servers pending approval."
+      : `**Pending servers (${pending.length})**\n${options.map((o) => `• ${o.label} \`${o.value}\``).join("\n")}`,
+  ];
+
+  // Discord rejects a select with zero options, so pending guilds add the rows.
+  const components: ActionRowBuilder<StringSelectMenuBuilder>[] = [];
+  if (options.length > 0) {
+    components.push(
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder().setCustomId(encodeId("a_approve")).setPlaceholder("Approve a server").addOptions(options)
+      ),
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder().setCustomId(encodeId("a_reject")).setPlaceholder("Reject a server").addOptions(options)
+      )
+    );
+  }
+
+  return { embeds: [new EmbedBuilder().setDescription(lines.join("\n"))], components };
+}
+
 discord.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+  if (
+    !interaction.isChatInputCommand() &&
+    !interaction.isStringSelectMenu() &&
+    !interaction.isButton()
+  )
+    return;
   const { guildId } = interaction;
+  // The now-playing card is posted to the last channel a command was used in.
+  if (guildId) guildTextChannel.set(guildId, interaction.channelId);
 
   // Gate on guild approval: pending or unknown guilds can't use bot commands.
-  if (guildId) {
+  // Admins are exempt because the web panel that approved guilds is going away
+  // and /admin must be reachable inside a pending guild to bootstrap it.
+  if (guildId && !ADMIN_DISCORD_IDS.has(interaction.user.id)) {
     const guildRecord = await db.select().from(guilds).where(eq(guilds.id, guildId)).get();
     if (!guildRecord || !guildRecord.approved) {
       await interaction.reply({ content: "⏳ This server is pending admin approval.", ephemeral: true });
@@ -1687,6 +1067,235 @@ discord.on(Events.InteractionCreate, async (interaction) => {
   }
 
   try {
+    if (interaction.isStringSelectMenu()) {
+      const decoded = decodeId(interaction.customId);
+      if (decoded?.action === "search_pick") {
+        // The URL is the payload, so this needs no server-side state and still
+        // works after a restart. Drop the picker up front so it can't queue twice.
+        const url = interaction.values[0];
+        const source = url ? detectSource(url) : null;
+        await interaction.update({ components: [] });
+        if (!guildId || !url || !source) {
+          await interaction.editReply({ content: "⚠️ That search result can no longer be played.", components: [] });
+          return;
+        }
+        await queueTrackForGuild(interaction, guildId, url, source);
+      }
+
+      // /admin approve/reject selects. Reproduces the two HTTP admin routes
+      // (POST /api/admin/guilds/:guildId/approve|reject) exactly, including the
+      // fields they set and the kick on reject.
+      if (decoded?.action === "a_approve" || decoded?.action === "a_reject") {
+        if (!ADMIN_DISCORD_IDS.has(interaction.user.id)) {
+          await interaction.reply({ content: "🚫 Not authorized.", ephemeral: true });
+          return;
+        }
+        const target = interaction.values[0];
+        if (!target) return;
+
+        if (decoded.action === "a_approve") {
+          await db
+            .update(guilds)
+            .set({ approved: true, approvedAt: nowSeconds() })
+            .where(eq(guilds.id, target))
+            .run();
+          console.log(`✅ Guild ${target} approved by ${interaction.user.username}`);
+        } else {
+          await db.delete(guilds).where(eq(guilds.id, target)).run();
+          teardownGuild(target);
+          const guild = discord.guilds.cache.get(target);
+          if (guild) {
+            try { await guild.leave(); } catch (e) { console.error(`Failed to leave guild ${target}:`, e); }
+          }
+          console.log(`❌ Guild ${target} rejected by ${interaction.user.username}`);
+        }
+
+        await interaction.update(await adminView());
+        await interaction.followUp({
+          content: decoded.action === "a_approve" ? `✅ Approved **${target}**.` : `❌ Rejected **${target}**.`,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      // Queue panel selects. The page rides in the customId so the re-render
+      // lands on the page the user was looking at.
+      if (decoded?.action === "q_vote" || decoded?.action === "q_remove") {
+        const guild = decoded.args[1];
+        const page = Number(decoded.args[0]);
+        const songId = Number(interaction.values[0]);
+        if (!guild || !Number.isFinite(songId)) return;
+        const roomId = guild;
+        const song = await db.select().from(songs).where(eq(songs.id, songId)).get();
+        const before = await loadQueue(roomId);
+
+        if (!song) {
+          await interaction.update(queuePanel(before, page, guild, interaction.user.id));
+          await interaction.followUp({ content: "⚠️ That song is no longer in the queue.", ephemeral: true });
+          return;
+        }
+
+        if (decoded.action === "q_vote") {
+          const existing = await db
+            .select()
+            .from(votes)
+            .where(and(eq(votes.songId, songId), eq(votes.userId, interaction.user.id)))
+            .get();
+          if (existing) {
+            await interaction.update(queuePanel(before, page, guild, interaction.user.id));
+            await interaction.followUp({ content: `🗳️ You already upvoted **${song.title || song.videoId}**.`, ephemeral: true });
+            return;
+          }
+          await db.insert(votes).values({ songId, userId: interaction.user.id }).run();
+          await db.update(songs).set({ votes: (song.votes ?? 0) + 1 }).where(eq(songs.id, songId)).run();
+          await interaction.update(queuePanel(await loadQueue(roomId), page, guild, interaction.user.id));
+          await interaction.followUp({ content: `👍 Upvoted **${song.title || song.videoId}**.`, ephemeral: true });
+          return;
+        }
+
+        // Same gate as DELETE /api/rooms/:id/songs/:songId: the song's adder or
+        // a global admin (ADMIN_DISCORD_IDS holds raw Discord user ids).
+        const isOwner = !!song.addedByUserId && song.addedByUserId === interaction.user.id;
+        if (!isOwner && !ADMIN_DISCORD_IDS.has(interaction.user.id)) {
+          await interaction.update(queuePanel(before, page, guild, interaction.user.id));
+          await interaction.followUp({ content: "🚫 You can only remove songs you added.", ephemeral: true });
+          return;
+        }
+        await db.transaction(async (tx) => {
+          await tx.delete(votes).where(eq(votes.songId, songId));
+          await tx.delete(skipVotes).where(eq(skipVotes.songId, songId));
+          await tx.delete(songs).where(eq(songs.id, songId));
+        });
+        await interaction.update(queuePanel(await loadQueue(roomId), page, guild, interaction.user.id));
+        await interaction.followUp({ content: `🗑️ Removed **${song.title || song.videoId}**.`, ephemeral: true });
+        return;
+      }
+      return;
+    }
+
+    if (interaction.isButton()) {
+      const decoded = decodeId(interaction.customId);
+      if (!decoded) return;
+
+      // Now-playing card buttons. They mirror the two HTTP skip routes rather
+      // than inventing a moderator bypass: vote-skip casts this user's vote and
+      // stops the track once the threshold is reached.
+      if (decoded.action === "p_skipvote" || decoded.action === "p_skip") {
+        const guild = decoded.args[0];
+        if (!guild) return;
+        // The guild is the room, so the id the button carries is the room id.
+        const roomId = guild;
+        const current = await currentSongForRoom(roomId, guild);
+        if (!current) {
+          await interaction.reply({ content: "📭 Nothing is playing", ephemeral: true });
+          return;
+        }
+
+        const threshold = skipThreshold(roomPresence(roomId));
+        const isOwner = !!current.addedByUserId && current.addedByUserId === interaction.user.id;
+        const votes = await skipVoteCount(current.id);
+        const title = current.title || current.videoId;
+
+        if (isOwner) {
+          await markSkipped(guild, current.id);
+          await interaction.reply({ content: `⏭️ Skipped **${title}** — you added it.`, ephemeral: true });
+          return;
+        }
+
+        if (decoded.action === "p_skip") {
+          if (votes < threshold) {
+            await interaction.reply({
+              content: `🗳️ Not enough votes to skip **${title}** — ${votes}/${threshold}. The person who added it can skip anytime.`,
+              ephemeral: true,
+            });
+            return;
+          }
+          await markSkipped(guild, current.id);
+          await interaction.reply({ content: `⏭️ Skipped **${title}** — ${votes}/${threshold} votes.`, ephemeral: true });
+          return;
+        }
+
+        const existing = await db
+          .select()
+          .from(skipVotes)
+          .where(and(eq(skipVotes.songId, current.id), eq(skipVotes.userId, interaction.user.id)))
+          .get();
+        if (existing) {
+          await interaction.reply({ content: `🗳️ You already voted to skip **${title}** — ${votes}/${threshold}.`, ephemeral: true });
+          return;
+        }
+
+        await db.insert(skipVotes).values({ songId: current.id, userId: interaction.user.id }).run();
+        if (votes + 1 >= threshold) {
+          await markSkipped(guild, current.id);
+          await interaction.reply({ content: `⏭️ Skipped **${title}** — ${votes + 1}/${threshold} votes.`, ephemeral: true });
+          return;
+        }
+        await interaction.reply({ content: `🗳️ Vote to skip **${title}** registered — ${votes + 1}/${threshold}.`, ephemeral: true });
+        return;
+      }
+
+      // Bulk-skip the rest of a playlist. Mirrors POST
+      // /api/rooms/:id/playlists/:playlistId/skip: only the playlist's adder or
+      // a global admin may do it, and the player stops only when the streaming
+      // song is itself one of the skipped rows.
+      if (decoded.action === "p_skippl") {
+        const guild = decoded.args[0];
+        if (!guild) return;
+        const roomId = guild;
+        const current = await currentSongForRoom(roomId, guild);
+        if (!current?.playlistId) {
+          await interaction.reply({ content: "📭 Nothing is playing from a playlist", ephemeral: true });
+          return;
+        }
+
+        const pending = await db
+          .select()
+          .from(songs)
+          .where(and(eq(songs.roomId, roomId), eq(songs.playlistId, current.playlistId), eq(songs.played, false)))
+          .all();
+        if (pending.length === 0) {
+          await interaction.reply({ content: "📭 No pending songs in this playlist", ephemeral: true });
+          return;
+        }
+
+        const isOwner = pending[0].addedByUserId === interaction.user.id;
+        if (!isOwner && !ADMIN_DISCORD_IDS.has(interaction.user.id)) {
+          await interaction.reply({ content: "🚫 Only the playlist's adder or an admin can skip it.", ephemeral: true });
+          return;
+        }
+
+        const ids = pending.map((s) => s.id);
+        await db.update(songs).set({ played: true }).where(inArray(songs.id, ids)).run();
+        await db.delete(skipVotes).where(inArray(skipVotes.songId, ids)).run();
+
+        const track = currentTracks.get(guild);
+        if (track && ids.includes(track.songId)) {
+          recentSkip.add(guild);
+          players.get(guild)?.stop();
+        }
+
+        console.log(`⏩ Playlist "${pending[0].playlistTitle}" skipped in guild ${guild} by ${interaction.user.username}`);
+        await interaction.reply({ content: `⏩ Skipped ${ids.length} songs from playlist **${pending[0].playlistTitle || "playlist"}**.`, ephemeral: true });
+        return;
+      }
+
+      if (!["q_prev", "q_refresh", "q_next"].includes(decoded.action)) return;
+      const guild = decoded.args[1];
+      const requested = Number(decoded.args[0]);
+      if (!guild) return;
+      const roomId = guild;
+      const queue = await loadQueue(roomId);
+      // Clamp against the queue as it is now, not as it was when the panel was
+      // rendered — songs get voted, removed, or played out while it sits idle.
+      const target =
+        decoded.action === "q_prev" ? requested - 1 : decoded.action === "q_next" ? requested + 1 : requested;
+      await interaction.update(
+        queuePanel(queue, clampPage(target, queue.length), guild, interaction.user.id)
+      );
+      return;
+    }
+
     if (interaction.commandName === "play") {
       const url = interaction.options.getString("url");
       if (!url || !guildId) {
@@ -1699,47 +1308,35 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      const voiceChannel = interaction.member?.voice?.channel as
-        | VoiceBasedChannel
-        | null
-        | undefined;
-      if (!voiceChannel) {
-        await interaction.reply("You need to be in a voice channel!");
+      await queueTrackForGuild(interaction, guildId, url, source);
+    }
+
+    if (interaction.commandName === "search") {
+      if (!guildId) return;
+      const query = interaction.options.getString("query");
+      const source = (interaction.options.getString("source") ?? "youtube") as SearchableSource;
+
+      // yt-dlp takes seconds, so acknowledge first and edit with the results.
+      await interaction.deferReply({ ephemeral: true });
+      if (!query) {
+        await interaction.editReply("Provide something to search for.");
         return;
       }
 
-      await interaction.deferReply();
-
-      const roomId = guildRoomMap.get(guildId) || userCurrentRoom.get(interaction.user.id) || guildId;
-
-      await ensureRoom(roomId, interaction.user.id);
-
-      const resolved = await resolveSingleTrack(url, source);
-      if (!resolved) {
-        await interaction.editReply("Could not resolve track");
+      const options = toSelectOptions(await searchTracks(query, source, 10));
+      if (options.length === 0) {
+        await interaction.editReply(`🔍 No results for **${query}**.`);
         return;
       }
-      const { title, uploader, thumbnail } = resolved;
 
-      await db.insert(songs).values({
-        roomId,
-        videoId: resolved.videoId,
-        source,
-        url: resolved.url,
-        title,
-        uploader,
-        thumbnail,
-        addedBy: interaction.user.username,
-        addedByUserId: interaction.user.id,
+      const select = new StringSelectMenuBuilder()
+        .setCustomId(encodeId("search_pick"))
+        .setPlaceholder(`Pick a ${source} result`)
+        .addOptions(options);
+      await interaction.editReply({
+        content: `🔍 Results for **${query}** — pick one to queue:`,
+        components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)],
       });
-
-      await new Promise((r) => setTimeout(r, 50));
-
-      guildRoomMap.set(guildId, roomId);
-      await connectToVoiceChannel(guildId, voiceChannel.id);
-      await playNextFromRoom(roomId, guildId);
-
-      await interaction.editReply(`Added to queue: **${title || url}**`);
     }
 
     if (interaction.commandName === "listen") {
@@ -1755,14 +1352,11 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.deferReply();
 
-      const roomId = guildRoomMap.get(guildId) || userCurrentRoom.get(interaction.user.id) || guildId;
-
-      guildRoomMap.set(guildId, roomId);
+      const roomId = guildId;
       await connectToVoiceChannel(guildId, voiceChannel.id);
       await playNextFromRoom(roomId, guildId);
 
-      const roomMsg = roomId !== guildId ? `room **${roomId}**` : "this server";
-      await interaction.editReply(`▶️ Starting queue from ${roomMsg}...`);
+      await interaction.editReply("▶️ Starting queue from this server...");
     }
 
     if (interaction.commandName === "stop") {
@@ -1779,22 +1373,13 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.commandName === "skip") {
       if (!guildId) return;
-      const roomId = guildRoomMap.get(guildId) || guildId;
+      const roomId = guildId;
 
       // Mirror the web skip gate (POST /api/rooms/:id/skip): the adder can
-      // always skip, otherwise the song needs skipThreshold upvotes from the
-      // room's present listeners (web + Discord voice). Without this /skip
-      // was a one-click bypass of the vote system the web enforces.
-      const track = currentTracks.get(guildId);
-      const current = track
-        ? await db.select().from(songs).where(eq(songs.id, track.songId)).get()
-        : await db
-            .select()
-            .from(songs)
-            .where(and(eq(songs.roomId, roomId), eq(songs.played, false)))
-            .orderBy(desc(songs.votes), songs.createdAt)
-            .get();
-
+      // always skip, otherwise the song needs skipThreshold skip-votes from the
+      // room's present listeners. Without this /skip was a one-click bypass of
+      // the vote system the web enforces.
+      const current = await currentSongForRoom(roomId, guildId);
       if (!current) {
         await interaction.reply({ content: "📭 Nothing is playing", ephemeral: true });
         return;
@@ -1802,7 +1387,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 
       const threshold = skipThreshold(roomPresence(roomId));
       const isOwner = !!current.addedByUserId && current.addedByUserId === interaction.user.id;
-      const skipVotesCount = (await db.select({ c: sql<number>`count(*)` }).from(skipVotes).where(eq(skipVotes.songId, current.id)).get())?.c ?? 0;
+      const skipVotesCount = await skipVoteCount(current.id);
       if (!isOwner && skipVotesCount < threshold) {
         await interaction.reply({
           content: `🗳️ Not enough votes to skip **${current.title || current.videoId}** — ${skipVotesCount}/${threshold}. The person who added it can skip anytime.`,
@@ -1811,38 +1396,37 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      await db.update(songs).set({ played: true }).where(eq(songs.id, current.id)).run();
-      await db.delete(skipVotes).where(eq(skipVotes.songId, current.id)).run();
-      recentSkip.add(guildId);
-      players.get(guildId)?.stop();
+      await markSkipped(guildId, current.id);
       await interaction.reply("⏭️ Skipped");
     }
 
     if (interaction.commandName === "queue") {
       if (!guildId) return;
-      const roomId = guildRoomMap.get(guildId) || guildId;
+      const roomId = guildId;
+      const queue = await loadQueue(roomId);
+      // Public, not ephemeral: this panel is the shared queue everyone in the
+      // channel votes and removes from.
+      await interaction.reply(queuePanel(queue, 1, guildId, interaction.user.id));
+    }
 
-      const queue = db
-        .select()
-        .from(songs)
-        .where(eq(songs.roomId, roomId))
-        .orderBy(desc(songs.votes), songs.createdAt)
-        .all()
-        .filter((s) => !s.played);
-
-      if (queue.length === 0) {
-        await interaction.reply("📭 Queue is empty");
+    if (interaction.commandName === "lyrics") {
+      if (!guildId) return;
+      const roomId = guildId;
+      const current = await currentSongForRoom(roomId, guildId);
+      if (!current) {
+        await interaction.reply({ content: "📭 Nothing is playing", ephemeral: true });
         return;
       }
-
-      const list = queue
-        .map(
-          (s, i) =>
-            `${i + 1}. **${s.title || s.videoId}** (votes: ${s.votes}) — by ${s.addedBy}`
-        )
-        .join("\n");
-
-      await interaction.reply(`🎵 **Queue:**\n${list}`);
+      const found = await fetchLyrics(current.title || current.videoId, current.uploader);
+      const text = found ? formatLyrics(found) : null;
+      if (!text) {
+        await interaction.reply({
+          content: `❌ No lyrics found for **${current.title || current.videoId}**.`,
+          ephemeral: true,
+        });
+        return;
+      }
+      await interaction.reply({ content: text, ephemeral: true });
     }
 
     if (interaction.commandName === "reset") {
@@ -1852,28 +1436,24 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: "🚫 You need **Manage Server** permission to reset the queue.", ephemeral: true });
         return;
       }
-      const roomId = guildRoomMap.get(guildId) || guildId;
+      const roomId = guildId;
 
       await db.update(songs).set({ played: false }).where(eq(songs.roomId, roomId)).run();
       await interaction.reply("🔄 Queue reset — all songs are now playable");
     }
 
-    // Report which room this guild's playback is fed from (the guildRoomMap
-    // entry), so people in the server can see and join the same room in the
-    // browser. Falls back to the guild's own id when nothing has been bound
-    // yet — but only after /play or /listen sets the map, so a missing entry
-    // means the bot has never been started here.
+    // The guild is the room, so there is no bound room id to resolve. The row
+    // only exists once /play or /listen has started something here.
     if (interaction.commandName === "room") {
       if (!guildId) return;
-      const roomId = guildRoomMap.get(guildId);
-      if (!roomId) {
-        await interaction.reply("📭 No room bound to this server yet. Use `/play` or `/listen` to start.");
+      const roomId = guildId;
+      const room = await db.select().from(rooms).where(eq(rooms.id, roomId)).get();
+      if (!room) {
+        await interaction.reply("📭 Nothing started here yet — use `/play` or `/listen` to start a queue.");
         return;
       }
 
-      const room = await db.select().from(rooms).where(eq(rooms.id, roomId)).get();
       const connected = connections.has(guildId);
-      const isDefault = roomId === guildId;
 
       const counts = await db
         .select({
@@ -1887,7 +1467,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       const pending = Number(counts?.pending ?? 0);
 
       let ownerLine: string | null = null;
-      if (room?.createdBy) {
+      if (room.createdBy) {
         const owner = await db
           .select({ username: users.username })
           .from(users)
@@ -1907,13 +1487,8 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         nowLine = `• Now playing: **${cur?.title || cur?.videoId || `#${track.songId}`}**`;
       }
 
-      const header = isDefault
-        ? "🎵 This server is playing from its **default queue**"
-        : `🎵 This server is playing from room **${roomId}**`;
       const lines = [
-        header,
         `• Room ID: \`${roomId}\``,
-        `• Open in browser: ${FRONTEND_URL}/room/${roomId}`,
         ownerLine,
         `• Bot: ${connected ? "🔊 Connected" : "💤 Not connected"}`,
         nowLine,
@@ -1922,8 +1497,23 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.reply(lines.join("\n"));
     }
+
+    if (interaction.commandName === "admin") {
+      if (!ADMIN_DISCORD_IDS.has(interaction.user.id)) {
+        await interaction.reply({ content: "🚫 Not authorized.", ephemeral: true });
+        return;
+      }
+      await interaction.reply({ ...(await adminView()), ephemeral: true });
+    }
+
+    if (interaction.commandName === "help") {
+      // Built from the registered set, so it can never drift from /commands.
+      const lines = commands.map((c) => `• \`/${c.name}\` — ${c.description}`);
+      await interaction.reply({ content: `**Commands**\n${lines.join("\n")}`, ephemeral: true });
+    }
   } catch (err) {
-    console.error(`Interaction '${interaction.commandName}' failed:`, err);
+    const label = interaction.isChatInputCommand() ? `'${interaction.commandName}'` : `component '${interaction.customId}'`;
+    console.error(`Interaction ${label} failed:`, err);
     try {
       const msg = "⚠️ Something went wrong handling that command.";
       if (interaction.deferred || interaction.replied) await interaction.editReply(msg);
@@ -1933,11 +1523,10 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 });
 
 // --- Periodic maintenance ---
-// Reap rooms that hold no songs, have nobody present, and have been idle past
-// the TTL. Auto-created rooms (a visit upserts the row) would otherwise pile up.
+// Reap rooms that hold no songs and have been idle past the TTL. Auto-created
+// rooms (a visit upserts the row) would otherwise pile up.
 async function gcEmptyRooms() {
   const cutoff = nowSeconds() - Math.floor(ROOM_TTL_MS / 1000);
-  const present = new Set(userCurrentRoom.values());
   const allRooms = await db.select().from(rooms).all();
 
   // Which rooms hold songs? One query instead of one-per-room.
@@ -1949,9 +1538,7 @@ async function gcEmptyRooms() {
 
   const stale = allRooms.filter((room) => {
     const lastActivity = room.lastActivityAt ?? room.createdAt ?? 0;
-    return (
-      lastActivity <= cutoff && !present.has(room.id) && !nonEmpty.has(room.id)
-    );
+    return lastActivity <= cutoff && !nonEmpty.has(room.id);
   });
 
   for (const room of stale) {
@@ -1981,15 +1568,31 @@ async function purgePlayedSongs() {
   console.log(`🧹 GC: purged ${ids.length} old played song(s)`);
 }
 
-function pruneRateBuckets() {
-  const now = Date.now();
-  for (const [k, b] of rateBuckets) if (now > b.resetAt) rateBuckets.delete(k);
+// Rooms created by the removed browser flow are keyed by a random nanoid, so
+// nothing reaches them any more — playback, the queue UI, and gcEmptyRooms all
+// address a room by its guild id. Drop their songs, votes, and rows once; on
+// later boots the filter matches nothing.
+async function purgeUnreachableRooms() {
+  const roomIds = (
+    await db.selectDistinct({ id: rooms.id }).from(rooms).all()
+  ).map((r) => r.id);
+  const orphaned = roomIds.filter((id) => !discord.guilds.cache.has(id));
+  if (orphaned.length === 0) return;
+  const songIds = (
+    await db.select({ id: songs.id }).from(songs).where(inArray(songs.roomId, orphaned)).all()
+  ).map((s) => s.id);
+  await db.transaction(async (tx) => {
+    await tx.delete(votes).where(inArray(votes.songId, songIds));
+    await tx.delete(skipVotes).where(inArray(skipVotes.songId, songIds));
+    await tx.delete(songs).where(inArray(songs.id, songIds));
+    await tx.delete(rooms).where(inArray(rooms.id, orphaned));
+  });
+  console.log(`🧹 GC: purged ${orphaned.length} unreachable room(s) left by the removed browser flow`);
 }
 
 async function runMaintenance() {
   try { await gcEmptyRooms(); } catch (e) { console.error("gcEmptyRooms failed:", e); }
   try { await purgePlayedSongs(); } catch (e) { console.error("purgePlayedSongs failed:", e); }
-  pruneRateBuckets();
 }
 
 setInterval(runMaintenance, 60 * 60 * 1000); // hourly
@@ -2013,35 +1616,30 @@ function isAloneInVoice(guildId: string): boolean {
   return true;
 }
 
-// Discord listeners in the bot's voice channel don't register web presence
-// (userCurrentRoom is only populated via the browser), so without this the
-// skip threshold would ignore them and a minority web vote could skip a song
-// many people are listening to in voice. Counts non-bot members in the bot's
-// channel across every guild bound to the room.
+// Listeners per guild: the non-bot members in the bot's joined voice channel.
+// Presence is voice-only now, and a guild has an entry in `connections`
+// exactly when the bot is in one of its voice channels. The bot's own member
+// is excluded so the skip threshold counts listeners, not itself.
 function voicePresenceByRoom(): Map<string, number> {
   const map = new Map<string, number>();
   const botId = discord.user?.id;
-  for (const [guildId, roomId] of guildRoomMap) {
-    const conn = connections.get(guildId);
-    if (!conn) continue;
+  for (const [guildId, conn] of connections) {
     const channelId = conn.joinConfig.channelId;
     if (!channelId) continue;
     const guild = discord.guilds.cache.get(guildId);
     if (!guild) continue;
     for (const vs of guild.voiceStates.cache.values()) {
       if (vs.channelId === channelId && vs.id !== botId) {
-        map.set(roomId, (map.get(roomId) ?? 0) + 1);
+        map.set(guildId, (map.get(guildId) ?? 0) + 1);
       }
     }
   }
   return map;
 }
 
-// Total listeners in a room: web presence + Discord voice presence.
+// Present listeners in a room: the voice count for that guild.
 function roomPresence(roomId: string): number {
-  const web = [...userCurrentRoom.values()].filter((r) => r === roomId).length;
-  const voice = voicePresenceByRoom().get(roomId) ?? 0;
-  return web + voice;
+  return voicePresenceByRoom().get(roomId) ?? 0;
 }
 
 async function hasUnplayedSongs(roomId: string): Promise<boolean> {
@@ -2056,7 +1654,7 @@ async function hasUnplayedSongs(roomId: string): Promise<boolean> {
 async function reapIdleVoiceConnections() {
   const now = Date.now();
   for (const guildId of [...connections.keys()]) {
-    const roomId = guildRoomMap.get(guildId);
+    const roomId = guildId;
 
     // Alone in the voice channel — leave quickly.
     if (isAloneInVoice(guildId)) {
@@ -2073,7 +1671,7 @@ async function reapIdleVoiceConnections() {
     }
 
     // Empty queue (and nothing currently playing) — leave after the grace period.
-    if (!currentTracks.has(guildId) && roomId) {
+    if (!currentTracks.has(guildId)) {
       if (!(await hasUnplayedSongs(roomId))) {
         if (!emptySince.has(guildId)) emptySince.set(guildId, now);
         if (now - emptySince.get(guildId)! >= EMPTY_QUEUE_LEAVE_MS) {

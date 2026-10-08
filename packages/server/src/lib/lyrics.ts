@@ -1,3 +1,7 @@
+// Lyrics lookup via lrclib.net, for the /lyrics command.
+
+export const DISCORD_MESSAGE_LIMIT = 2000;
+
 export interface LrcLine {
   timeMs: number;
   text: string;
@@ -54,15 +58,6 @@ export function parseLrc(lrc: string): LrcLine[] {
   return lines.sort((a, b) => a.timeMs - b.timeMs);
 }
 
-export function getCurrentLineIndex(lines: LrcLine[], elapsedMs: number): number {
-  let idx = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].timeMs <= elapsedMs) idx = i;
-    else break;
-  }
-  return idx;
-}
-
 export async function fetchLyrics(
   title: string,
   artist?: string | null
@@ -100,4 +95,17 @@ export async function fetchLyrics(
   } catch {
     return null;
   }
+}
+
+// No karaoke sync over Discord: the panel's timing is not reproducible in a
+// message, so the bot posts the text once and Discord rejects anything past
+// 2000 characters.
+export function formatLyrics(
+  lyrics: { lines: LrcLine[]; plain: string | null },
+  maxLength = DISCORD_MESSAGE_LIMIT
+): string | null {
+  const plain = lyrics.plain?.trim();
+  const text = plain || lyrics.lines.map((line) => line.text).join("\n").trim();
+  if (!text) return null;
+  return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}…`;
 }

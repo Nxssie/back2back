@@ -1,4 +1,4 @@
-# --- Builder: install deps, compile native modules, build web, fetch yt-dlp ---
+# --- Builder: install deps, compile native modules, fetch yt-dlp ---
 FROM oven/bun:1 AS builder
 WORKDIR /app
 
@@ -14,12 +14,7 @@ RUN curl --retry 5 --retry-delay 3 --retry-all-errors -L -o /usr/local/bin/yt-dl
 
 COPY package.json bun.lock* ./
 COPY packages/server/package.json ./packages/server/
-COPY packages/web/package.json ./packages/web/
 RUN bun install
-
-# Build the web frontend (Vite) — output: packages/web/dist
-COPY packages/web/ ./packages/web/
-RUN cd packages/web && bun run build
 
 # Server source (bun runs TS directly, no build step)
 COPY packages/server/ ./packages/server/

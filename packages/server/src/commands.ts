@@ -11,6 +11,22 @@ export const commands = [
       option.setName("url").setDescription("YouTube, SoundCloud, Mixcloud, or Twitch URL").setRequired(true)
     ),
   new SlashCommandBuilder()
+    .setName("search")
+    .setDescription("Search for a track and queue it")
+    .addStringOption((option) =>
+      option.setName("query").setDescription("Track or artist to search for").setRequired(true)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("source")
+        .setDescription("Where to search")
+        .addChoices(
+          { name: "YouTube", value: "youtube" },
+          { name: "SoundCloud", value: "soundcloud" },
+          { name: "Twitch", value: "twitch" }
+        )
+    ),
+  new SlashCommandBuilder()
     .setName("listen")
     .setDescription("Join voice channel and start the queue"),
   new SlashCommandBuilder()
@@ -23,9 +39,18 @@ export const commands = [
     .setName("queue")
     .setDescription("Show the current queue"),
   new SlashCommandBuilder()
+    .setName("lyrics")
+    .setDescription("Show the lyrics of the current track"),
+  new SlashCommandBuilder()
     .setName("reset")
     .setDescription("Reset all songs to be playable again"),
   new SlashCommandBuilder()
     .setName("room")
     .setDescription("Show which room this server is currently playing from"),
+  new SlashCommandBuilder()
+    .setName("admin")
+    .setDescription("Approve or reject servers waiting for access"),
+  new SlashCommandBuilder()
+    .setName("help")
+    .setDescription("List the available commands"),
 ].map((command) => command.toJSON());
