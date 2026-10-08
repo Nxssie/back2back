@@ -1000,6 +1000,22 @@ function queuePanel(queue: QueueSong[], page: number, guildId: string, userId: s
   return { embeds: [new EmbedBuilder().setDescription(view.text)], components };
 }
 
+// The deleted OAuth flow was the only writer of `users`, and both vote tables
+// carry a foreign key to it — so without this, a member who never logged into
+// the web app cannot upvote or vote-skip, and the insert fails with
+// SQLITE_CONSTRAINT_FOREIGNKEY. Upserting on every interaction also keeps a
+// renamed user current for the /room owner line and /admin.
+async function rememberUser(user: { id: string; username: string; avatar: string | null }): Promise<void> {
+  await db
+    .insert(users)
+    .values({ id: user.id, username: user.username, avatar: user.avatar })
+    .onConflictDoUpdate({
+      target: users.id,
+      set: { username: user.username, avatar: user.avatar },
+    })
+    .run();
+}
+
 // Moderation overview for /admin. Every render reads the DB fresh so an action
 // never shows a list the database no longer has.
 async function adminView() {
@@ -1067,6 +1083,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
   }
 
   try {
+    await rememberUser(interaction.user);
     if (interaction.isStringSelectMenu()) {
       const decoded = decodeId(interaction.customId);
       if (decoded?.action === "search_pick") {
