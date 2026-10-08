@@ -1,6 +1,4 @@
-// Lyrics lookup via lrclib.net, moved here from the web package so the bot can
-// serve /lyrics. The web copy still exists and disappears with packages/web in
-// the deletion slice — there is no second runtime consumer to keep in sync.
+// Lyrics lookup via lrclib.net, for the /lyrics command.
 
 export const DISCORD_MESSAGE_LIMIT = 2000;
 
