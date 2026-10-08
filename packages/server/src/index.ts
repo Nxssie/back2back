@@ -35,8 +35,8 @@ import { db } from "./db";
 import { users, rooms, songs, votes, skipVotes, guilds, type Song } from "./db/schema";
 import { eq, desc, and, inArray, lt, sql } from "drizzle-orm";
 import { commands } from "./commands";
-import { extractVideoId } from "./lib/youtube";
-import { detectSource, type Source } from "./lib/sources";
+import { extractVideoId, isPlaylistUrl } from "./lib/youtube";
+import { detectSource, isSoundcloudSetUrl, type Source } from "./lib/sources";
 import { skipThreshold } from "./lib/voting";
 import { YTDLP_BASE_ARGS, YTDLP_DOWNLOAD_ARGS } from "./lib/ytdlp";
 import { searchTracks, toSelectOptions, type SearchableSource } from "./lib/search";
@@ -380,6 +380,45 @@ async function resolveSingleTrack(
   return resolveSoundcloudTrack(url);
 }
 
+// `source` picks how each flat-playlist entry's url is built: YouTube entries
+// reliably carry only an id, so the canonical watch url is reconstructed;
+// SoundCloud flat-playlist entries carry their own (sometimes internal API,
+// not the public webpage) url and never a title — titles for those are filled
+// in lazily by playNextFromRoomInner, same as any song missing a title.
+async function resolvePlaylist(
+  url: string,
+  source: Source
+): Promise<{ title: string; entries: Array<{ videoId: string; title: string | null; url: string }> } | null> {
+  return new Promise((resolve) => {
+    const proc = spawn(
+      "yt-dlp",
+      ["--flat-playlist", "--dump-single-json", "--no-warnings", ...YTDLP_BASE_ARGS, url],
+      { stdio: ["ignore", "pipe", "ignore"], timeout: 30000 }
+    );
+    let output = "";
+    proc.stdout.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+    proc.on("close", () => {
+      try {
+        const data = JSON.parse(output.trim());
+        const entries = (data.entries || [])
+          .filter((e: any) => e.id)
+          .map((e: any) => ({
+            videoId: String(e.id),
+            title: e.title ? String(e.title) : null,
+            url: source === "youtube"
+              ? `https://www.youtube.com/watch?v=${e.id}`
+              : String(e.webpage_url || e.url || ""),
+          }))
+          .filter((e: { url: string }) => e.url);
+        resolve({ title: data.title || "Playlist", entries });
+      } catch {
+        resolve(null);
+      }
+    });
+    proc.on("error", () => resolve(null));
+  });
+}
+
 // Fully release a guild's playback: kill child processes, stop the player,
 // destroy the voice connection, and drop all per-guild state. Idempotent.
 function teardownGuild(guildId: string) {
@@ -530,7 +569,7 @@ async function currentSongForRoom(roomId: string, guildId: string): Promise<Song
       .select()
       .from(songs)
       .where(and(eq(songs.roomId, roomId), eq(songs.played, false)))
-      .orderBy(desc(songs.votes), songs.createdAt)
+      .orderBy(desc(songs.votes), songs.createdAt, songs.id)
       .get()) ?? null
   );
 }
@@ -570,22 +609,31 @@ async function publishNowPlaying(guildId: string, song: Song): Promise<void> {
   try {
     const channel = await discord.channels.fetch(channelId);
     if (!channel?.isTextBased()) return;
+    const buttons = [
+      new ButtonBuilder()
+        .setCustomId(encodeId("p_skipvote", guildId))
+        .setLabel("Vote skip")
+        .setEmoji("🗳️")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(encodeId("p_skip", guildId))
+        .setLabel("Skip")
+        .setEmoji("⏭️")
+        .setStyle(ButtonStyle.Secondary),
+    ];
+    // A playlist-backed track gets the bulk skip; a lone URL has nothing else to skip.
+    if (song.playlistId) {
+      buttons.push(
+        new ButtonBuilder()
+          .setCustomId(encodeId("p_skippl", guildId))
+          .setLabel("Skip playlist")
+          .setEmoji("⏩")
+          .setStyle(ButtonStyle.Secondary)
+      );
+    }
     const payload = {
       embeds: [nowPlayingEmbed(song)],
-      components: [
-        new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder()
-            .setCustomId(encodeId("p_skipvote", guildId))
-            .setLabel("Vote skip")
-            .setEmoji("🗳️")
-            .setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId(encodeId("p_skip", guildId))
-            .setLabel("Skip")
-            .setEmoji("⏭️")
-            .setStyle(ButtonStyle.Secondary)
-        ),
-      ],
+      components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
     };
     const previous = nowPlayingMessage.get(guildId);
     if (previous?.channelId === channelId) {
@@ -613,7 +661,7 @@ async function playNextFromRoomInner(roomId: string, guildId: string) {
     .select()
     .from(songs)
     .where(eq(songs.roomId, roomId))
-    .orderBy(desc(songs.votes), songs.createdAt)
+    .orderBy(desc(songs.votes), songs.createdAt, songs.id)
     .all();
 
   const nextSong = allSongs.find((s) => !s.played);
@@ -815,24 +863,54 @@ async function queueTrackForGuild(
 
   await ensureRoom(roomId, interaction.user.id);
 
-  const resolved = await resolveSingleTrack(url, source);
-  if (!resolved) {
-    await interaction.editReply("Could not resolve track");
-    return;
-  }
-  const { title, uploader, thumbnail } = resolved;
+  // A playlist and a single track differ only in how many rows they produce;
+  // both end in the same insert and play tail, so their order and room binding
+  // cannot drift apart.
+  let label: string;
+  let rows: (typeof songs.$inferInsert)[];
 
-  await db.insert(songs).values({
-    roomId,
-    videoId: resolved.videoId,
-    source,
-    url: resolved.url,
-    title,
-    uploader,
-    thumbnail,
-    addedBy: interaction.user.username,
-    addedByUserId: interaction.user.id,
-  });
+  if (isPlaylistUrl(url) || isSoundcloudSetUrl(url)) {
+    const playlist = await resolvePlaylist(url, source);
+    if (!playlist || playlist.entries.length === 0) {
+      await interaction.editReply("Could not resolve playlist");
+      return;
+    }
+
+    const playlistId = crypto.randomUUID();
+    rows = playlist.entries.map((e) => ({
+      roomId,
+      videoId: e.videoId,
+      source,
+      url: e.url,
+      title: e.title,
+      addedBy: interaction.user.username,
+      addedByUserId: interaction.user.id,
+      playlistId,
+      playlistTitle: playlist.title,
+    }));
+    label = `📋 Added playlist **${playlist.title}** — ${playlist.entries.length} songs`;
+  } else {
+    const resolved = await resolveSingleTrack(url, source);
+    if (!resolved) {
+      await interaction.editReply("Could not resolve track");
+      return;
+    }
+
+    rows = [{
+      roomId,
+      videoId: resolved.videoId,
+      source,
+      url: resolved.url,
+      title: resolved.title,
+      uploader: resolved.uploader,
+      thumbnail: resolved.thumbnail,
+      addedBy: interaction.user.username,
+      addedByUserId: interaction.user.id,
+    }];
+    label = `Added to queue: **${resolved.title || url}**`;
+  }
+
+  await db.insert(songs).values(rows);
 
   await new Promise((r) => setTimeout(r, 50));
 
@@ -840,18 +918,20 @@ async function queueTrackForGuild(
   await connectToVoiceChannel(guildId, voiceChannel.id);
   await playNextFromRoom(roomId, guildId);
 
-  await interaction.editReply({ content: `Added to queue: **${title || url}**`, components: [] });
+  await interaction.editReply({ content: label, components: [] });
 }
 
 // The queue read-model every /queue surface shares: the unplayed, vote-ordered
-// rows the HTTP songs route and auto-advance already use, so the command and
-// its buttons, selects, and re-renders can never disagree about what is queued.
+// rows auto-advance and the /queue panel both use, so the command and its
+// buttons, selects, and re-renders can never disagree about what is queued.
+// `id` is the tiebreaker because a playlist's rows share one `createdAt` second
+// and would otherwise play in an arbitrary order while their votes are equal.
 async function loadQueue(roomId: string): Promise<QueueSong[]> {
   const rows = await db
     .select()
     .from(songs)
     .where(eq(songs.roomId, roomId))
-    .orderBy(desc(songs.votes), songs.createdAt)
+    .orderBy(desc(songs.votes), songs.createdAt, songs.id)
     .all();
   return rows.filter((s) => !s.played);
 }
@@ -1154,6 +1234,51 @@ discord.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
         await interaction.reply({ content: `🗳️ Vote to skip **${title}** registered — ${votes + 1}/${threshold}.`, ephemeral: true });
+        return;
+      }
+
+      // Bulk-skip the rest of a playlist. Mirrors POST
+      // /api/rooms/:id/playlists/:playlistId/skip: only the playlist's adder or
+      // a global admin may do it, and the player stops only when the streaming
+      // song is itself one of the skipped rows.
+      if (decoded.action === "p_skippl") {
+        const guild = decoded.args[0];
+        if (!guild) return;
+        const roomId = guildRoomMap.get(guild) || guild;
+        const current = await currentSongForRoom(roomId, guild);
+        if (!current?.playlistId) {
+          await interaction.reply({ content: "📭 Nothing is playing from a playlist", ephemeral: true });
+          return;
+        }
+
+        const pending = await db
+          .select()
+          .from(songs)
+          .where(and(eq(songs.roomId, roomId), eq(songs.playlistId, current.playlistId), eq(songs.played, false)))
+          .all();
+        if (pending.length === 0) {
+          await interaction.reply({ content: "📭 No pending songs in this playlist", ephemeral: true });
+          return;
+        }
+
+        const isOwner = pending[0].addedByUserId === interaction.user.id;
+        if (!isOwner && !ADMIN_DISCORD_IDS.has(interaction.user.id)) {
+          await interaction.reply({ content: "🚫 Only the playlist's adder or an admin can skip it.", ephemeral: true });
+          return;
+        }
+
+        const ids = pending.map((s) => s.id);
+        await db.update(songs).set({ played: true }).where(inArray(songs.id, ids)).run();
+        await db.delete(skipVotes).where(inArray(skipVotes.songId, ids)).run();
+
+        const track = currentTracks.get(guild);
+        if (track && ids.includes(track.songId)) {
+          recentSkip.add(guild);
+          players.get(guild)?.stop();
+        }
+
+        console.log(`⏩ Playlist "${pending[0].playlistTitle}" skipped in guild ${guild} by ${interaction.user.username}`);
+        await interaction.reply({ content: `⏩ Skipped ${ids.length} songs from playlist **${pending[0].playlistTitle || "playlist"}**.`, ephemeral: true });
         return;
       }
 
