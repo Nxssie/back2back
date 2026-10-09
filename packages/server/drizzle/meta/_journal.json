@@ -78,6 +78,13 @@
       "when": 1791446248885,
       "tag": "0010_powerful_blob",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1791533125990,
+      "tag": "0011_rapid_loners",
+      "breakpoints": true
     }
   ]
 }

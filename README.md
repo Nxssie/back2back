@@ -11,8 +11,8 @@ a slash command or a button.
 - **YouTube, SoundCloud, Mixcloud & Twitch** — single tracks, YouTube playlists, and SoundCloud sets.
 - **Search in Discord** — `/search` lists results as a select menu, no links to copy.
 - **Interactive queue panel** — `/queue` pages through the queue with upvote and remove controls.
-- **Now-playing card** — one message per guild, updated per track, with vote-skip and playlist controls.
-- **Vote-to-skip** — threshold based on who is actually listening in the voice channel; the song's adder skips free.
+- **Now-playing card** — one message per guild, updated per track, with skip and playlist controls.
+- **Single-person skip** — any member can skip the current song, or the rest of a playlist, no vote gate.
 - **Lyrics** — `/lyrics` fetches the current track's lyrics.
 - **Server moderation** — `/admin` approves or rejects servers; admins can act on any queue.
 - **Hardened by default** — adversarial input validated at the boundary, hourly GC of stale rooms and old played songs, /metrics fails closed, graceful shutdown.
@@ -121,16 +121,16 @@ bun dev:server   # http://localhost:3001
 | `/queue` | Paginated queue panel with upvote and remove controls |
 | `/lyrics` | Lyrics for the track currently playing |
 | `/listen` | Join your voice channel and start the queue |
-| `/skip` | Skip the current song (adder free; otherwise needs votes) |
+| `/skip` | Skip the current song, for any member |
 | `/stop` | Stop playback and disconnect (Manage Server) |
 | `/reset` | Mark every song playable again (Manage Server) |
 | `/room` | Which queue this server is playing and whether the bot is connected |
 | `/admin` | Approve or reject servers waiting for access (admins only) |
 | `/help` | List the available commands |
 
-The now-playing card carries the per-track controls: **Vote skip**, **Skip**, and
-— for playlist tracks — **Skip playlist**, which marks the rest of that playlist
-played.
+The now-playing card carries the per-track controls: **Skip** and — for playlist
+tracks — **Skip playlist**, which marks the rest of that playlist played. Any
+member can use either.
 
 Buttons and select menus carry their whole payload in the component id, so they
 keep working across bot restarts and stale messages left in a channel.

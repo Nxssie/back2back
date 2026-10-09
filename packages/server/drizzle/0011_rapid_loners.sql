@@ -1,0 +1,1 @@
+DROP TABLE `skip_votes`;

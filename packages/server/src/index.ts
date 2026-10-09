@@ -32,12 +32,11 @@ import {
   type VoiceConnection,
 } from "@discordjs/voice";
 import { db } from "./db";
-import { users, rooms, songs, votes, skipVotes, guilds, type Song } from "./db/schema";
+import { users, rooms, songs, votes, guilds, type Song } from "./db/schema";
 import { eq, desc, and, inArray, lt, sql } from "drizzle-orm";
 import { commands } from "./commands";
 import { extractVideoId, isPlaylistUrl } from "./lib/youtube";
 import { detectSource, isSoundcloudSetUrl, type Source } from "./lib/sources";
-import { skipThreshold } from "./lib/voting";
 import { YTDLP_BASE_ARGS, YTDLP_DOWNLOAD_ARGS } from "./lib/ytdlp";
 import { searchTracks, toSelectOptions, type SearchableSource } from "./lib/search";
 import { encodeId, decodeId } from "./lib/components";
@@ -459,7 +458,6 @@ function setupPlayer(guildId: string): AudioPlayer {
     const wasSkip = recentSkip.delete(guildId); // consume the skip marker, if any
     track.cleanup();
     await db.update(songs).set({ played: true }).where(eq(songs.id, track.songId)).run();
-    await db.delete(skipVotes).where(eq(skipVotes.songId, track.songId)).run();
     currentTracks.delete(guildId);
 
     const roomId = guildId;
@@ -573,17 +571,10 @@ async function currentSongForRoom(roomId: string, guildId: string): Promise<Song
   );
 }
 
-async function skipVoteCount(songId: number): Promise<number> {
-  return (
-    await db.select({ c: sql<number>`count(*)` }).from(skipVotes).where(eq(skipVotes.songId, songId)).get()
-  )?.c ?? 0;
-}
-
 // Mark played before stopping the player, the order both skip routes use, so
 // the DB is already consistent when the Idle handler tries to mark it again.
 async function markSkipped(guildId: string, songId: number): Promise<void> {
   await db.update(songs).set({ played: true }).where(eq(songs.id, songId)).run();
-  await db.delete(skipVotes).where(eq(skipVotes.songId, songId)).run();
   recentSkip.add(guildId);
   players.get(guildId)?.stop();
 }
@@ -609,11 +600,6 @@ async function publishNowPlaying(guildId: string, song: Song): Promise<void> {
     const channel = await discord.channels.fetch(channelId);
     if (!channel?.isTextBased()) return;
     const buttons = [
-      new ButtonBuilder()
-        .setCustomId(encodeId("p_skipvote", guildId))
-        .setLabel("Vote skip")
-        .setEmoji("🗳️")
-        .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
         .setCustomId(encodeId("p_skip", guildId))
         .setLabel("Skip")
@@ -1180,7 +1166,6 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         }
         await db.transaction(async (tx) => {
           await tx.delete(votes).where(eq(votes.songId, songId));
-          await tx.delete(skipVotes).where(eq(skipVotes.songId, songId));
           await tx.delete(songs).where(eq(songs.id, songId));
         });
         await interaction.update(queuePanel(await loadQueue(roomId), page, guild, interaction.user.id));
@@ -1194,10 +1179,10 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       const decoded = decodeId(interaction.customId);
       if (!decoded) return;
 
-      // Now-playing card buttons. They mirror the two HTTP skip routes rather
-      // than inventing a moderator bypass: vote-skip casts this user's vote and
-      // stops the track once the threshold is reached.
-      if (decoded.action === "p_skipvote" || decoded.action === "p_skip") {
+      // The now-playing card's Skip button: any member can skip the current
+      // song unconditionally. The vote gate and the HTTP skip routes it used to
+      // mirror were removed with the web app.
+      if (decoded.action === "p_skip") {
         const guild = decoded.args[0];
         if (!guild) return;
         // The guild is the room, so the id the button carries is the room id.
@@ -1208,54 +1193,14 @@ discord.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const threshold = skipThreshold(roomPresence(roomId));
-        const isOwner = !!current.addedByUserId && current.addedByUserId === interaction.user.id;
-        const votes = await skipVoteCount(current.id);
         const title = current.title || current.videoId;
-
-        if (isOwner) {
-          await markSkipped(guild, current.id);
-          await interaction.reply({ content: `⏭️ Skipped **${title}** — you added it.`, ephemeral: true });
-          return;
-        }
-
-        if (decoded.action === "p_skip") {
-          if (votes < threshold) {
-            await interaction.reply({
-              content: `🗳️ Not enough votes to skip **${title}** — ${votes}/${threshold}. The person who added it can skip anytime.`,
-              ephemeral: true,
-            });
-            return;
-          }
-          await markSkipped(guild, current.id);
-          await interaction.reply({ content: `⏭️ Skipped **${title}** — ${votes}/${threshold} votes.`, ephemeral: true });
-          return;
-        }
-
-        const existing = await db
-          .select()
-          .from(skipVotes)
-          .where(and(eq(skipVotes.songId, current.id), eq(skipVotes.userId, interaction.user.id)))
-          .get();
-        if (existing) {
-          await interaction.reply({ content: `🗳️ You already voted to skip **${title}** — ${votes}/${threshold}.`, ephemeral: true });
-          return;
-        }
-
-        await db.insert(skipVotes).values({ songId: current.id, userId: interaction.user.id }).run();
-        if (votes + 1 >= threshold) {
-          await markSkipped(guild, current.id);
-          await interaction.reply({ content: `⏭️ Skipped **${title}** — ${votes + 1}/${threshold} votes.`, ephemeral: true });
-          return;
-        }
-        await interaction.reply({ content: `🗳️ Vote to skip **${title}** registered — ${votes + 1}/${threshold}.`, ephemeral: true });
+        await markSkipped(guild, current.id);
+        await interaction.reply({ content: `⏭️ Skipped **${title}**`, ephemeral: true });
         return;
       }
 
-      // Bulk-skip the rest of a playlist. Mirrors POST
-      // /api/rooms/:id/playlists/:playlistId/skip: only the playlist's adder or
-      // a global admin may do it, and the player stops only when the streaming
-      // song is itself one of the skipped rows.
+      // Bulk-skip the rest of a playlist. Any member may do it, and the player
+      // stops only when the streaming song is itself one of the skipped rows.
       if (decoded.action === "p_skippl") {
         const guild = decoded.args[0];
         if (!guild) return;
@@ -1276,15 +1221,8 @@ discord.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const isOwner = pending[0].addedByUserId === interaction.user.id;
-        if (!isOwner && !ADMIN_DISCORD_IDS.has(interaction.user.id)) {
-          await interaction.reply({ content: "🚫 Only the playlist's adder or an admin can skip it.", ephemeral: true });
-          return;
-        }
-
         const ids = pending.map((s) => s.id);
         await db.update(songs).set({ played: true }).where(inArray(songs.id, ids)).run();
-        await db.delete(skipVotes).where(inArray(skipVotes.songId, ids)).run();
 
         const track = currentTracks.get(guild);
         if (track && ids.includes(track.songId)) {
@@ -1392,24 +1330,12 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       if (!guildId) return;
       const roomId = guildId;
 
-      // Mirror the web skip gate (POST /api/rooms/:id/skip): the adder can
-      // always skip, otherwise the song needs skipThreshold skip-votes from the
-      // room's present listeners. Without this /skip was a one-click bypass of
-      // the vote system the web enforces.
+      // Any member who runs /skip skips the current song unconditionally. The
+      // vote gate and the HTTP skip route it used to mirror were removed with
+      // the web app.
       const current = await currentSongForRoom(roomId, guildId);
       if (!current) {
         await interaction.reply({ content: "📭 Nothing is playing", ephemeral: true });
-        return;
-      }
-
-      const threshold = skipThreshold(roomPresence(roomId));
-      const isOwner = !!current.addedByUserId && current.addedByUserId === interaction.user.id;
-      const skipVotesCount = await skipVoteCount(current.id);
-      if (!isOwner && skipVotesCount < threshold) {
-        await interaction.reply({
-          content: `🗳️ Not enough votes to skip **${current.title || current.videoId}** — ${skipVotesCount}/${threshold}. The person who added it can skip anytime.`,
-          ephemeral: true,
-        });
         return;
       }
 
@@ -1579,7 +1505,6 @@ async function purgePlayedSongs() {
   const ids = old.map((s) => s.id);
   await db.transaction(async (tx) => {
     await tx.delete(votes).where(inArray(votes.songId, ids));
-    await tx.delete(skipVotes).where(inArray(skipVotes.songId, ids));
     await tx.delete(songs).where(inArray(songs.id, ids));
   });
   console.log(`🧹 GC: purged ${ids.length} old played song(s)`);
@@ -1600,7 +1525,6 @@ async function purgeUnreachableRooms() {
   ).map((s) => s.id);
   await db.transaction(async (tx) => {
     await tx.delete(votes).where(inArray(votes.songId, songIds));
-    await tx.delete(skipVotes).where(inArray(skipVotes.songId, songIds));
     await tx.delete(songs).where(inArray(songs.id, songIds));
     await tx.delete(rooms).where(inArray(rooms.id, orphaned));
   });
@@ -1631,32 +1555,6 @@ function isAloneInVoice(guildId: string): boolean {
     if (vs.channelId === channelId && vs.id !== botId) return false;
   }
   return true;
-}
-
-// Listeners per guild: the non-bot members in the bot's joined voice channel.
-// Presence is voice-only now, and a guild has an entry in `connections`
-// exactly when the bot is in one of its voice channels. The bot's own member
-// is excluded so the skip threshold counts listeners, not itself.
-function voicePresenceByRoom(): Map<string, number> {
-  const map = new Map<string, number>();
-  const botId = discord.user?.id;
-  for (const [guildId, conn] of connections) {
-    const channelId = conn.joinConfig.channelId;
-    if (!channelId) continue;
-    const guild = discord.guilds.cache.get(guildId);
-    if (!guild) continue;
-    for (const vs of guild.voiceStates.cache.values()) {
-      if (vs.channelId === channelId && vs.id !== botId) {
-        map.set(guildId, (map.get(guildId) ?? 0) + 1);
-      }
-    }
-  }
-  return map;
-}
-
-// Present listeners in a room: the voice count for that guild.
-function roomPresence(roomId: string): number {
-  return voicePresenceByRoom().get(roomId) ?? 0;
 }
 
 async function hasUnplayedSongs(roomId: string): Promise<boolean> {
