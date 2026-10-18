@@ -8,7 +8,7 @@ a slash command or a button.
 ## Features
 
 - **Vote-ordered queue** — the highest-voted unplayed track plays next; ties break by insertion order.
-- **YouTube, SoundCloud, Mixcloud & Twitch** — single tracks, YouTube playlists, and SoundCloud sets.
+- **YouTube, SoundCloud, Mixcloud & Twitch** — single tracks, YouTube playlists, YouTube radio (Mix) links (their first 25 songs), and SoundCloud sets.
 - **Search in Discord** — `/search` lists results as a select menu, no links to copy.
 - **Interactive queue panel** — `/queue` pages through the queue with upvote and remove controls.
 - **Now-playing card** — one message per guild, updated per track, with skip and playlist controls.
@@ -117,7 +117,7 @@ bun dev:server   # http://localhost:3001
 
 | Command | What it does |
 |---|---|
-| `/play <url>` | Queue a track, playlist, or set and start playing |
+| `/play <url>` | Queue a track, playlist, radio (first 25 songs), or set and start playing |
 | `/search <query> [source]` | Search YouTube, SoundCloud, or Twitch, then pick from a select menu |
 | `/queue` | Paginated queue panel with upvote and remove controls |
 | `/lyrics` | Lyrics for the track currently playing |
