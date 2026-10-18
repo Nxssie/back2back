@@ -35,7 +35,7 @@ import { db } from "./db";
 import { users, rooms, songs, votes, guilds, type Song } from "./db/schema";
 import { eq, desc, and, inArray, lt, sql } from "drizzle-orm";
 import { commands } from "./commands";
-import { extractVideoId, isPlaylistUrl } from "./lib/youtube";
+import { extractVideoId, isPlaylistUrl, isRadioUrl, RADIO_TRACK_LIMIT } from "./lib/youtube";
 import { detectSource, isSoundcloudSetUrl, type Source } from "./lib/sources";
 import { YTDLP_BASE_ARGS, YTDLP_DOWNLOAD_ARGS } from "./lib/ytdlp";
 import { searchTracks, toSelectOptions, type SearchableSource } from "./lib/search";
@@ -389,14 +389,23 @@ async function resolveSingleTrack(
 // SoundCloud flat-playlist entries carry their own (sometimes internal API,
 // not the public webpage) url and never a title — titles for those are filled
 // in lazily by playNextFromRoomInner, same as any song missing a title.
+// `limit` caps how many entries yt-dlp walks (`--playlist-end`); it exists for
+// endless playlists like YouTube radios, which would otherwise take seconds to
+// enumerate hundreds of songs nobody asked for.
 async function resolvePlaylist(
   url: string,
-  source: Source
+  source: Source,
+  limit?: number
 ): Promise<{ title: string; entries: Array<{ videoId: string; title: string | null; url: string }> } | null> {
   return new Promise((resolve) => {
     const proc = spawn(
       "yt-dlp",
-      ["--flat-playlist", "--dump-single-json", "--no-warnings", ...YTDLP_BASE_ARGS, url],
+      [
+        "--flat-playlist", "--dump-single-json", "--no-warnings",
+        ...(limit ? ["--playlist-end", String(limit)] : []),
+        ...YTDLP_BASE_ARGS,
+        url,
+      ],
       { stdio: ["ignore", "pipe", "ignore"], timeout: 30000 }
     );
     let output = "";
@@ -923,8 +932,11 @@ async function queueTrackForGuild(
   let label: string;
   let rows: (typeof songs.$inferInsert)[];
 
-  if (isPlaylistUrl(url) || isSoundcloudSetUrl(url)) {
-    const playlist = await resolvePlaylist(url, source);
+  // A radio carries `v=` like a single-video link, but the user pasted it for
+  // the list, so it takes the playlist path — capped, since a radio never ends.
+  const radio = isRadioUrl(url);
+  if (radio || isPlaylistUrl(url) || isSoundcloudSetUrl(url)) {
+    const playlist = await resolvePlaylist(url, source, radio ? RADIO_TRACK_LIMIT : undefined);
     if (!playlist || playlist.entries.length === 0) {
       await interaction.editReply("Could not resolve playlist");
       return;
