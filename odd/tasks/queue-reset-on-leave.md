@@ -11,7 +11,7 @@ starts from zero.
 | State | **Code complete** — checks green; independent verification unavailable (the verifier returned no report) |
 | Branch | `fix/queue-reset-on-leave` (from `main` at `302542e`) |
 | Slices | queue helper → ack policy → wiring → docs; 520 authored lines over 4 commits, so the review unit is the whole branch, not one commit |
-| Tasks | 7 |
+| Tasks | 8 |
 | Blocked on the user | push / PR decision (the branch is local, not pushed) |
 
 ## Decisions locked
@@ -67,6 +67,12 @@ starts from zero.
       `Disconnected` handler ownership, `/play` playback feedback (S6, S7). `e7bee73`
 - [x] **T6** — `README.md` update (S8)
 - [x] **T7** — Checks and evidence (S9)
+- [x] **T8** — Review fixes (S2, S5, S6), route: direct inline (2 files, cause
+      already mapped by the review): a stale connection no longer clears the
+      songs `/play` just inserted (`endStaleSession` runs before the insert;
+      `connectToVoiceChannel` only tears down); `ephemeralNotice` deletes the
+      public "thinking…" placeholder before its ephemeral follow-up (or edits an
+      already-private defer); `/skip`'s empty answer edits its ephemeral defer.
 
 ## Evidence
 
@@ -77,6 +83,8 @@ starts from zero.
 | Differential vs `302542e` | server booted on both trees without a token against fresh databases: `/health`, `/ready`, `/metrics` (200 with token, 403 without) and `/nope` (404) identical, and stdout identical after stripping timestamps |
 | Database rules | `pendingQueue.test.ts` runs the real `drizzle/` migrations on a temp file database (a `:memory:` database cannot serve drizzle's transaction, which opens its own connection) |
 | Slice boundary | After `36d7d54` the branch is past the ~400 authored-line review slice (520). Review it as one unit; any follow-up work goes on top, not inside these commits. |
+| T8 `bun test` | 71 pass, 0 fail (8 files); +3 `ephemeralNotice` cases in `ack.test.ts` |
+| T8 build / types | `bun build` exit 0; ad-hoc `tsc --strict` on `index.ts` reports only the 3 pre-existing errors (`bun` module types, `member.voice` at the two voice gates) |
 | Independent verification | **Unavailable** — `gentle-ai-verify` was launched on `e7bee73` and returned no final report. Not retried: an unavailable verifier is reported, not escalated. The remaining outside view is the user's review or a new verification run. |
 
 ## Known residue

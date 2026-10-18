@@ -35,3 +35,34 @@ export function replyIsEphemeral(commandName: string): boolean {
 export function unclassifiedCommands(names: readonly string[]): string[] {
   return names.filter((name) => !Object.hasOwn(EPHEMERAL_REPLIES, name));
 }
+
+// Some answers must stay private even though their command defers publicly —
+// a permission denial, a server pending approval. A deferred reply keeps showing
+// "thinking…" until it is edited or deleted, so a bare followUp would leave that
+// placeholder hanging in the channel until Discord marks it as failed. The
+// public placeholder is deleted first and the answer follows up ephemerally;
+// an already-private defer is simply edited. If the delete fails, the answer
+// falls back to editing the placeholder so the command is still answered.
+type EphemeralNoticeInteraction = {
+  ephemeral: boolean | null;
+  editReply(content: string): Promise<unknown>;
+  deleteReply(): Promise<unknown>;
+  followUp(options: { content: string; ephemeral: true }): Promise<unknown>;
+};
+
+export async function ephemeralNotice(
+  interaction: EphemeralNoticeInteraction,
+  content: string
+): Promise<void> {
+  if (interaction.ephemeral) {
+    await interaction.editReply(content);
+    return;
+  }
+  try {
+    await interaction.deleteReply();
+  } catch {
+    await interaction.editReply(content);
+    return;
+  }
+  await interaction.followUp({ content, ephemeral: true });
+}

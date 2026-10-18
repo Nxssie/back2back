@@ -40,7 +40,7 @@ import { detectSource, isSoundcloudSetUrl, type Source } from "./lib/sources";
 import { YTDLP_BASE_ARGS, YTDLP_DOWNLOAD_ARGS } from "./lib/ytdlp";
 import { searchTracks, toSelectOptions, type SearchableSource } from "./lib/search";
 import { encodeId, decodeId } from "./lib/components";
-import { replyIsEphemeral, unclassifiedCommands } from "./lib/ack";
+import { replyIsEphemeral, unclassifiedCommands, ephemeralNotice } from "./lib/ack";
 import { clearPendingQueue } from "./lib/pendingQueue";
 import { formatQueuePage, clampPage, slicePage, type QueueSong } from "./lib/queue";
 import { fetchLyrics, formatLyrics } from "./lib/lyrics";
@@ -531,6 +531,21 @@ function setupPlayer(guildId: string): AudioPlayer {
   return player;
 }
 
+// A registered connection that Discord already dropped is a session that never
+// got a clean leave, so its pending songs may still be queued. Ending it through
+// leaveVoice clears them, so a new /play starts from zero instead of resuming
+// the old queue. It must run before the caller inserts its own songs.
+async function endStaleSession(guildId: string): Promise<void> {
+  const existing = connections.get(guildId);
+  if (
+    existing &&
+    (existing.state.status === VoiceConnectionStatus.Destroyed ||
+      existing.state.status === VoiceConnectionStatus.Disconnected)
+  ) {
+    await leaveVoice(guildId, "stale voice connection");
+  }
+}
+
 async function connectToVoiceChannel(
   guildId: string,
   channelId: string
@@ -546,8 +561,11 @@ async function connectToVoiceChannel(
     ) {
       return existing;
     }
-    connections.delete(guildId);
-    try { existing.destroy(); } catch {}
+    // Only tear the dead session down here, never clear the queue: callers
+    // reach this after inserting their own songs (/play) or precisely to start
+    // the queue (/listen). /play clears the old session's songs earlier, in
+    // endStaleSession, before its insert.
+    teardownGuild(guildId);
   }
 
   const guild = discord.guilds.cache.get(guildId);
@@ -950,6 +968,7 @@ async function queueTrackForGuild(
   // decision taken in this window would clear the song that just arrived.
   starting.add(guildId);
   try {
+    await endStaleSession(guildId);
     await db.insert(songs).values(rows);
 
     await new Promise((r) => setTimeout(r, 50));
@@ -1147,10 +1166,14 @@ discord.on(Events.InteractionCreate, async (interaction) => {
     const guildRecord = await db.select().from(guilds).where(eq(guilds.id, guildId)).get();
     if (!guildRecord || !guildRecord.approved) {
       const content = "⏳ This server is pending admin approval.";
-      // A chat input command is already deferred, so editReply is the only
-      // legal answer; component interactions answer with their own reply.
-      if (interaction.isChatInputCommand()) await interaction.editReply({ content });
-      else await interaction.reply({ content, ephemeral: true });
+      // A chat input command is already deferred; ephemeralNotice replaces
+      // its placeholder with a private answer. Component interactions answer
+      // with their own ephemeral reply.
+      if (interaction.isChatInputCommand()) {
+        await ephemeralNotice(interaction, content);
+      } else {
+        await interaction.reply({ content, ephemeral: true });
+      }
       return;
     }
   }
@@ -1407,7 +1430,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       // Disconnecting the bot affects everyone in the channel — gate to
       // server moderators rather than any member.
       if (!(interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageGuild) ?? false)) {
-        await interaction.editReply("🚫 You need **Manage Server** permission to stop the bot.");
+        await ephemeralNotice(interaction, "🚫 You need **Manage Server** permission to stop the bot.");
         return;
       }
       const cleared = await leaveVoice(guildId, "/stop");
@@ -1427,6 +1450,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       // the web app.
       const current = await currentSongForRoom(roomId, guildId);
       if (!current) {
+        // skip already defers ephemerally, so editing the reply keeps it private.
         await interaction.editReply("📭 Nothing is playing");
         return;
       }
@@ -1467,7 +1491,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       if (!guildId) return;
       // Resetting the whole queue is a room-wide action — gate to moderators.
       if (!(interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageGuild) ?? false)) {
-        await interaction.editReply("🚫 You need **Manage Server** permission to reset the queue.");
+        await ephemeralNotice(interaction, "🚫 You need **Manage Server** permission to reset the queue.");
         return;
       }
       const roomId = guildId;
@@ -1672,6 +1696,9 @@ async function reapIdleVoiceConnections() {
     if (isAloneInVoice(guildId)) {
       if (!aloneSince.has(guildId)) aloneSince.set(guildId, now);
       if (now - aloneSince.get(guildId)! >= ALONE_LEAVE_MS) {
+        // The guard above was checked before the awaits since then; a /play
+        // that started inside that window must not lose its song to this leave.
+        if (starting.has(guildId) || advancing.has(guildId)) continue;
         console.log(
           `👋 Bot alone in voice channel for ${ALONE_LEAVE_MS / 1000}s (guild ${guildId}); leaving.`
         );
@@ -1687,6 +1714,9 @@ async function reapIdleVoiceConnections() {
       if (!(await hasUnplayedSongs(roomId))) {
         if (!emptySince.has(guildId)) emptySince.set(guildId, now);
         if (now - emptySince.get(guildId)! >= EMPTY_QUEUE_LEAVE_MS) {
+          // Same race as the alone path: hasUnplayedSongs awaited above, so a
+          // /play that queued a song in the meantime must not be left behind.
+          if (starting.has(guildId) || advancing.has(guildId)) continue;
           console.log(
             `📭 Queue empty for ${Math.round(EMPTY_QUEUE_LEAVE_MS / 60_000)}min (guild ${guildId}); leaving.`
           );
