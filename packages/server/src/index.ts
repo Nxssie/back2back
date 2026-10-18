@@ -38,6 +38,7 @@ import { commands } from "./commands";
 import { extractVideoId, isPlaylistUrl, isRadioUrl, RADIO_TRACK_LIMIT } from "./lib/youtube";
 import { detectSource, isSoundcloudSetUrl, type Source } from "./lib/sources";
 import { YTDLP_BASE_ARGS, YTDLP_DOWNLOAD_ARGS } from "./lib/ytdlp";
+import { createInfoCache } from "./lib/infoCache";
 import { searchTracks, toSelectOptions, type SearchableSource } from "./lib/search";
 import { encodeId, decodeId } from "./lib/components";
 import { replyIsEphemeral, unclassifiedCommands, ephemeralNotice } from "./lib/ack";
@@ -147,6 +148,10 @@ async function ensureRoom(id: string, userId?: string | null) {
   return db.select().from(rooms).where(eq(rooms.id, id)).get();
 }
 
+// Info JSON from resolution (`yt-dlp -J`), keyed by the URL that will be
+// streamed, so the stream skips a second full extraction. See lib/infoCache.ts.
+const infoCache = createInfoCache();
+
 // --- yt-dlp + ffmpeg audio stream ---
 // Returns the audio resource plus a cleanup() that kills both child processes,
 // so a finished/skipped/stopped track never leaves yt-dlp or ffmpeg lingering.
@@ -154,14 +159,32 @@ function createAudioStream(url: string): {
   resource: AudioResource;
   cleanup: () => void;
 } {
-  const ytdlp = spawn(
-    "yt-dlp",
-    ["-f", "bestaudio", "--no-playlist", ...YTDLP_BASE_ARGS, ...YTDLP_DOWNLOAD_ARGS, "-o", "-", url],
-    // stderr is piped (not ignored) so an extraction failure — 403, "Sign in to
-    // confirm you're not a bot", "forcing SABR" — is logged instead of silently
-    // producing an empty stream that ends the track after ~2s.
-    { stdio: ["ignore", "pipe", "pipe"] }
-  );
+  // stderr is piped (not ignored) so an extraction failure — 403, "Sign in to
+  // confirm you're not a bot", "forcing SABR" — is logged instead of silently
+  // producing an empty stream that ends the track after ~2s.
+  //
+  // With cached info from resolution, yt-dlp reads it from stdin
+  // (`--load-info-json -`) and goes straight to the download: first audio
+  // arrives in ~0.5 s instead of ~2.0 s. Without it — never resolved through
+  // -J, expired, or already consumed — today's fresh extraction runs unchanged.
+  const cachedInfo = infoCache.take(url);
+  const ytdlp = cachedInfo
+    ? spawn(
+        "yt-dlp",
+        ["-f", "bestaudio", "--load-info-json", "-", ...YTDLP_BASE_ARGS, ...YTDLP_DOWNLOAD_ARGS, "-o", "-"],
+        { stdio: ["pipe", "pipe", "pipe"] }
+      )
+    : spawn(
+        "yt-dlp",
+        ["-f", "bestaudio", "--no-playlist", ...YTDLP_BASE_ARGS, ...YTDLP_DOWNLOAD_ARGS, "-o", "-", url],
+        { stdio: ["ignore", "pipe", "pipe"] }
+      );
+  if (cachedInfo && ytdlp.stdin) {
+    // A yt-dlp that dies before reading its stdin (killed by a skip, a bad
+    // binary) turns this write into EPIPE; unhandled, that would crash the bot.
+    ytdlp.stdin.on("error", (e) => console.error(`❌ yt-dlp stdin error for ${url}:`, e.message));
+    ytdlp.stdin.end(cachedInfo);
+  }
   let ytdlpErr = "";
   ytdlp.stderr.on("data", (chunk) => {
     if (ytdlpErr.length < 4000) ytdlpErr += chunk.toString();
@@ -217,19 +240,44 @@ function createAudioStream(url: string): {
   };
 }
 
+// One full yt-dlp extraction (`-J`) for a YouTube or generic track: title,
+// uploader and thumbnail for the queue, and the raw info JSON cached under
+// `url` so createAudioStream streams from it instead of extracting again.
+// `url` must be the exact URL the song is stored (and later streamed) with.
+// `-f bestaudio` makes the cached info carry the same format the stream would
+// pick. Never rejects: on any failure the title falls back to the url and
+// nothing is cached, so the stream does its own extraction as before.
+//
 // spawn (not exec) passes the URL as a literal argv entry, never through a
 // shell — this closes the command-injection sink that string interpolation
 // into `yt-dlp --get-title "..."` opened.
-function getVideoInfo(url: string): Promise<{ title: string; uploader: string | null }> {
+function getVideoInfo(
+  url: string
+): Promise<{ title: string; uploader: string | null; thumbnail: string | null }> {
   return new Promise((resolve) => {
-    const proc = spawn("yt-dlp", ["--get-title", "--no-warnings", ...YTDLP_BASE_ARGS, url], {
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 15000,
-    });
+    const proc = spawn(
+      "yt-dlp",
+      ["-J", "--no-playlist", "-f", "bestaudio", "--no-warnings", ...YTDLP_BASE_ARGS, url],
+      { stdio: ["ignore", "pipe", "ignore"], timeout: 15000 }
+    );
     let out = "";
-    proc.stdout.on("data", (chunk) => (out += chunk));
-    proc.on("close", () => resolve({ title: out.trim() || url, uploader: null }));
-    proc.on("error", () => resolve({ title: url, uploader: null }));
+    proc.stdout.on("data", (chunk: Buffer) => { out += chunk.toString(); });
+    proc.on("close", (code) => {
+      try {
+        if (code !== 0) throw new Error(`yt-dlp exited ${code}`);
+        const json = out.trim();
+        const d = JSON.parse(json);
+        if (d.title) infoCache.set(url, json);
+        resolve({
+          title: d.title ? String(d.title) : url,
+          uploader: d.uploader ?? d.channel ?? null,
+          thumbnail: d.thumbnail ?? d.thumbnails?.at(-1)?.url ?? null,
+        });
+      } catch {
+        resolve({ title: url, uploader: null, thumbnail: null });
+      }
+    });
+    proc.on("error", () => resolve({ title: url, uploader: null, thumbnail: null }));
   });
 }
 
@@ -366,6 +414,10 @@ async function resolveSingleTrack(
     const videoId = extractVideoId(url);
     if (!videoId) return null;
     const canonicalUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    // Cached under canonicalUrl: that is the url stored in songs.url and streamed.
+    // The thumbnail stays null: yt-dlp reports maxresdefault without checking
+    // it exists (older videos have none), while nowPlayingEmbed derives
+    // hqdefault.jpg from the id, which every video has.
     const { title, uploader } = await getVideoInfo(canonicalUrl);
     return { videoId, url: canonicalUrl, title, uploader, thumbnail: null };
   }
@@ -378,8 +430,8 @@ async function resolveSingleTrack(
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("")
       .slice(0, 16);
-    const { title, uploader } = await getVideoInfo(url);
-    return { videoId: hash, url, title, uploader, thumbnail: null };
+    const { title, uploader, thumbnail } = await getVideoInfo(url);
+    return { videoId: hash, url, title, uploader, thumbnail };
   }
   return resolveSoundcloudTrack(url);
 }
@@ -762,13 +814,18 @@ async function playNextFromRoomInner(roomId: string, guildId: string) {
         nextSong.url = info.url;
       }
     } else {
-      // YouTube, generic HLS/DASH
-      const { title, uploader } = await getVideoInfo(nextSong.url);
+      // YouTube, generic HLS/DASH. The extraction also caches the info under
+      // nextSong.url, which the stream below consumes — so a playlist entry
+      // that needed its title still extracts only once.
+      // YouTube keeps its derived hqdefault thumbnail (see resolveSingleTrack).
+      const { title, uploader, thumbnail } = await getVideoInfo(nextSong.url);
+      const art = nextSong.source === "youtube" ? nextSong.thumbnail : (nextSong.thumbnail ?? thumbnail);
       db.update(songs)
-        .set({ title, uploader })
+        .set({ title, uploader, thumbnail: art })
         .where(eq(songs.id, nextSong.id))
         .run();
       nextSong.title = title;
+      nextSong.thumbnail = art;
     }
   }
 
