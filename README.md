@@ -13,6 +13,7 @@ a slash command or a button.
 - **Interactive queue panel** — `/queue` pages through the queue with upvote and remove controls.
 - **Now-playing card** — one message per guild, updated per track, with skip and playlist controls.
 - **Single-person skip** — any member can skip the current song, or the rest of a playlist, no vote gate.
+- **Session-scoped queue** — the pending queue belongs to the current voice session; when the bot leaves the channel, it is cleared so the next session starts from zero.
 - **Lyrics** — `/lyrics` fetches the current track's lyrics.
 - **Server moderation** — `/admin` approves or rejects servers; admins can act on any queue.
 - **Hardened by default** — adversarial input validated at the boundary, hourly GC of stale rooms and old played songs, /metrics fails closed, graceful shutdown.
@@ -122,8 +123,8 @@ bun dev:server   # http://localhost:3001
 | `/lyrics` | Lyrics for the track currently playing |
 | `/listen` | Join your voice channel and start the queue |
 | `/skip` | Skip the current song, for any member |
-| `/stop` | Stop playback and disconnect (Manage Server) |
-| `/reset` | Mark every song playable again (Manage Server) |
+| `/stop` | Stop playback, leave the channel, and clear the pending queue (Manage Server) |
+| `/reset` | Mark every song playable again, inside the current session (Manage Server) |
 | `/room` | Which queue this server is playing and whether the bot is connected |
 | `/admin` | Approve or reject servers waiting for access (admins only) |
 | `/help` | List the available commands |
@@ -131,6 +132,17 @@ bun dev:server   # http://localhost:3001
 The now-playing card carries the per-track controls: **Skip** and — for playlist
 tracks — **Skip playlist**, which marks the rest of that playlist played. Any
 member can use either.
+
+A queue is scoped to one voice session. The bot leaves a channel when it has
+been alone for a minute or when the queue has been empty for
+`EMPTY_QUEUE_LEAVE_MINUTES`, and every leave — automatic, a failed voice
+reconnect, or `/stop` — deletes the room's pending songs and their votes. Played
+history stays for the `/room` counters and is purged by `PLAYED_SONG_TTL_HOURS`,
+so nobody comes back to a queue a previous session left behind.
+
+Every slash command is acknowledged before it does any work, so a slow database
+write or a slow yt-dlp lookup delays the answer instead of losing the command to
+an expired interaction.
 
 Buttons and select menus carry their whole payload in the component id, so they
 keep working across bot restarts and stale messages left in a channel.
