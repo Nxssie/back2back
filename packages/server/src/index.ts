@@ -14,6 +14,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
+  MessageFlags,
   type ChatInputCommandInteraction,
   type StringSelectMenuInteraction,
   type TextChannel,
@@ -1221,9 +1222,14 @@ discord.on(Events.InteractionCreate, async (interaction) => {
   // editReply and a slow path can only delay the answer, never drop it.
   if (interaction.isChatInputCommand()) {
     try {
-      await interaction.deferReply({ ephemeral: replyIsEphemeral(interaction.commandName) });
+      await interaction.deferReply(
+        replyIsEphemeral(interaction.commandName) ? { flags: MessageFlags.Ephemeral } : {}
+      );
     } catch (err) {
-      console.error(`Could not acknowledge '${interaction.commandName}':`, err);
+      // The age tells a late delivery or a stalled event loop (≥3000ms) apart
+      // from an interaction that expired for some other reason.
+      const ageMs = Date.now() - interaction.createdTimestamp;
+      console.error(`Could not acknowledge '${interaction.commandName}' (age ${ageMs}ms):`, err);
       return;
     }
   }
@@ -1241,7 +1247,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.isChatInputCommand()) {
         await ephemeralNotice(interaction, content);
       } else {
-        await interaction.reply({ content, ephemeral: true });
+        await interaction.reply({ content, flags: MessageFlags.Ephemeral });
       }
       return;
     }
@@ -1269,7 +1275,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
       // fields they set and the kick on reject.
       if (decoded?.action === "a_approve" || decoded?.action === "a_reject") {
         if (!ADMIN_DISCORD_IDS.has(interaction.user.id)) {
-          await interaction.reply({ content: "🚫 Not authorized.", ephemeral: true });
+          await interaction.reply({ content: "🚫 Not authorized.", flags: MessageFlags.Ephemeral });
           return;
         }
         const target = interaction.values[0];
@@ -1295,7 +1301,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         await interaction.update(await adminView());
         await interaction.followUp({
           content: decoded.action === "a_approve" ? `✅ Approved **${target}**.` : `❌ Rejected **${target}**.`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -1313,7 +1319,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
 
         if (!song) {
           await interaction.update(queuePanel(before, page, guild, interaction.user.id));
-          await interaction.followUp({ content: "⚠️ That song is no longer in the queue.", ephemeral: true });
+          await interaction.followUp({ content: "⚠️ That song is no longer in the queue.", flags: MessageFlags.Ephemeral });
           return;
         }
 
@@ -1325,13 +1331,13 @@ discord.on(Events.InteractionCreate, async (interaction) => {
             .get();
           if (existing) {
             await interaction.update(queuePanel(before, page, guild, interaction.user.id));
-            await interaction.followUp({ content: `🗳️ You already upvoted **${song.title || song.videoId}**.`, ephemeral: true });
+            await interaction.followUp({ content: `🗳️ You already upvoted **${song.title || song.videoId}**.`, flags: MessageFlags.Ephemeral });
             return;
           }
           await db.insert(votes).values({ songId, userId: interaction.user.id }).run();
           await db.update(songs).set({ votes: (song.votes ?? 0) + 1 }).where(eq(songs.id, songId)).run();
           await interaction.update(queuePanel(await loadQueue(roomId), page, guild, interaction.user.id));
-          await interaction.followUp({ content: `👍 Upvoted **${song.title || song.videoId}**.`, ephemeral: true });
+          await interaction.followUp({ content: `👍 Upvoted **${song.title || song.videoId}**.`, flags: MessageFlags.Ephemeral });
           return;
         }
 
@@ -1340,7 +1346,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         const isOwner = !!song.addedByUserId && song.addedByUserId === interaction.user.id;
         if (!isOwner && !ADMIN_DISCORD_IDS.has(interaction.user.id)) {
           await interaction.update(queuePanel(before, page, guild, interaction.user.id));
-          await interaction.followUp({ content: "🚫 You can only remove songs you added.", ephemeral: true });
+          await interaction.followUp({ content: "🚫 You can only remove songs you added.", flags: MessageFlags.Ephemeral });
           return;
         }
         await db.transaction(async (tx) => {
@@ -1348,7 +1354,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
           await tx.delete(songs).where(eq(songs.id, songId));
         });
         await interaction.update(queuePanel(await loadQueue(roomId), page, guild, interaction.user.id));
-        await interaction.followUp({ content: `🗑️ Removed **${song.title || song.videoId}**.`, ephemeral: true });
+        await interaction.followUp({ content: `🗑️ Removed **${song.title || song.videoId}**.`, flags: MessageFlags.Ephemeral });
         return;
       }
       return;
@@ -1368,13 +1374,13 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         const roomId = guild;
         const current = await currentSongForRoom(roomId, guild);
         if (!current) {
-          await interaction.reply({ content: "📭 Nothing is playing", ephemeral: true });
+          await interaction.reply({ content: "📭 Nothing is playing", flags: MessageFlags.Ephemeral });
           return;
         }
 
         const title = current.title || current.videoId;
         await markSkipped(guild, current.id);
-        await interaction.reply({ content: `⏭️ Skipped **${title}**`, ephemeral: true });
+        await interaction.reply({ content: `⏭️ Skipped **${title}**`, flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -1386,7 +1392,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         const roomId = guild;
         const current = await currentSongForRoom(roomId, guild);
         if (!current?.playlistId) {
-          await interaction.reply({ content: "📭 Nothing is playing from a playlist", ephemeral: true });
+          await interaction.reply({ content: "📭 Nothing is playing from a playlist", flags: MessageFlags.Ephemeral });
           return;
         }
 
@@ -1396,7 +1402,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
           .where(and(eq(songs.roomId, roomId), eq(songs.playlistId, current.playlistId), eq(songs.played, false)))
           .all();
         if (pending.length === 0) {
-          await interaction.reply({ content: "📭 No pending songs in this playlist", ephemeral: true });
+          await interaction.reply({ content: "📭 No pending songs in this playlist", flags: MessageFlags.Ephemeral });
           return;
         }
 
@@ -1410,7 +1416,7 @@ discord.on(Events.InteractionCreate, async (interaction) => {
         }
 
         console.log(`⏩ Playlist "${pending[0].playlistTitle}" skipped in guild ${guild} by ${interaction.user.username}`);
-        await interaction.reply({ content: `⏩ Skipped ${ids.length} songs from playlist **${pending[0].playlistTitle || "playlist"}**.`, ephemeral: true });
+        await interaction.reply({ content: `⏩ Skipped ${ids.length} songs from playlist **${pending[0].playlistTitle || "playlist"}**.`, flags: MessageFlags.Ephemeral });
         return;
       }
 
