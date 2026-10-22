@@ -1,3 +1,5 @@
+import { MessageFlags } from "discord.js";
+
 // Slash-command acknowledgment policy. Discord gives an interaction three
 // seconds to answer; anything slower (a SQLite write waiting on the busy
 // timeout, a yt-dlp round trip, a large playlist insert) makes Discord expire
@@ -47,7 +49,7 @@ type EphemeralNoticeInteraction = {
   ephemeral: boolean | null;
   editReply(content: string): Promise<unknown>;
   deleteReply(): Promise<unknown>;
-  followUp(options: { content: string; ephemeral: true }): Promise<unknown>;
+  followUp(options: { content: string; flags: MessageFlags.Ephemeral }): Promise<unknown>;
 };
 
 export async function ephemeralNotice(
@@ -64,5 +66,5 @@ export async function ephemeralNotice(
     await interaction.editReply(content);
     return;
   }
-  await interaction.followUp({ content, ephemeral: true });
+  await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
 }

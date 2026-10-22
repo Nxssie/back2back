@@ -1,4 +1,5 @@
 import { test, expect } from "bun:test";
+import { MessageFlags } from "discord.js";
 import { commands } from "../commands";
 import { EPHEMERAL_REPLIES, ephemeralNotice, replyIsEphemeral, unclassifiedCommands } from "./ack";
 
@@ -55,8 +56,8 @@ function fakeInteraction(ephemeral: boolean, deleteFails = false) {
       calls.push("delete");
       if (deleteFails) throw new Error("Unknown Message");
     },
-    async followUp(options: { content: string; ephemeral: true }) {
-      calls.push(`followUp:${options.content}:${options.ephemeral}`);
+    async followUp(options: { content: string; flags: MessageFlags.Ephemeral }) {
+      calls.push(`followUp:${options.content}:${options.flags === MessageFlags.Ephemeral}`);
     },
   };
 }
